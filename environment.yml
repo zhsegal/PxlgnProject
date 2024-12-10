@@ -1,0 +1,24 @@
+name: pixelgen-vi
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - bioconda
+dependencies:
+  - python=3.10
+  - pytorch
+  - pytorch-cuda=11.8
+  - ipython
+  - ipykernel
+  - ipywidgets
+  - matplotlib
+  - numpy
+  - pandas
+  - pip
+  - scvi-tools
+  - scanpy
+  - python-igraph
+  - leidenalg
+  - fastp
+  - pixelator
+

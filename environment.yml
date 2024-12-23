@@ -10,6 +10,7 @@ dependencies:
   - ipython
   - ipykernel
   - ipywidgets
+  - jaxlib>=0.4.26
   - matplotlib
   - numpy
   - pandas

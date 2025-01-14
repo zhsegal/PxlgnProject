@@ -4,22 +4,26 @@ channels:
   - nvidia
   - bioconda
 dependencies:
-  - python=3.10
+  - python>=3.10
   - pytorch
-  - pytorch-cuda=11.8
+  - pytorch-cuda
   - ipython
   - ipykernel
   - ipywidgets
-  - jaxlib>=0.4.26
+  - jaxlib>=0.4.3
   - matplotlib
   - numpy
   - pandas
   - pip
-  - scvi-tools
+  - scvi-tools>=1.2
+  - optax=0.2.0
   - scanpy
   - python-igraph
   - scikit-misc
   - leidenalg
   - fastp
-  - pixelator
+  # - pip
+  - pixelator=0.19
+  # - ray-tune
+  # - hyperopt
 

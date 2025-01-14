@@ -1,0 +1,8 @@
+#BSUB -J coloc-dataset
+#BSUB -q medium
+#BSUB -R rusage[mem=262144]
+#BSUB -R affinity[thread*4]
+
+cd /home/labs/nyosef/eitangr/pixelgen
+conda activate pixelgen-scvi-1
+python -m PixelGen.jobs.create_coloc_dataset > PixelGen/jobs/create_coloc_dataset.out 2>&1

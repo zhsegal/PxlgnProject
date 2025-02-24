@@ -1,57 +1,74 @@
 /home/labs/nyosef/eitangr/miniconda3/envs/pixelgen-scvi-1/lib/python3.11/site-packages/anndata/utils.py:429: FutureWarning: Importing read_elem from `anndata.experimental` is deprecated. Import anndata.io.read_elem instead.
   warnings.warn(msg, FutureWarning)
-[07/01/25 18:59:59]: Starting conversion...
-[07/01/25 19:04:45]: Component 0 finished
-[07/01/25 19:07:06]: Component 100 finished
-[07/01/25 19:09:26]: Component 200 finished
-[07/01/25 19:11:49]: Component 300 finished
-[07/01/25 19:14:12]: Component 400 finished
-[07/01/25 19:16:37]: Component 500 finished
-[07/01/25 19:19:01]: Component 600 finished
-[07/01/25 19:21:24]: Component 700 finished
-[07/01/25 19:23:47]: Component 800 finished
-[07/01/25 19:26:09]: Component 900 finished
-[07/01/25 19:28:29]: Component 1000 finished
-[07/01/25 19:30:55]: Component 1100 finished
-[07/01/25 19:33:20]: Component 1200 finished
-[07/01/25 19:35:44]: Component 1300 finished
-[07/01/25 19:38:09]: Component 1400 finished
-[07/01/25 19:40:33]: Component 1500 finished
-[07/01/25 19:42:56]: Component 1600 finished
-[07/01/25 19:45:21]: Component 1700 finished
-[07/01/25 19:47:46]: Component 1800 finished
-[07/01/25 19:50:08]: Component 1900 finished
-[07/01/25 19:52:31]: Component 2000 finished
-[07/01/25 19:55:10]: Component 2100 finished
-[07/01/25 19:57:45]: Component 2200 finished
-[07/01/25 20:00:21]: Component 2300 finished
-[07/01/25 20:02:55]: Component 2400 finished
-[07/01/25 20:05:31]: Component 2500 finished
-[07/01/25 20:08:04]: Component 2600 finished
-[07/01/25 20:10:39]: Component 2700 finished
-[07/01/25 20:13:13]: Component 2800 finished
-[07/01/25 20:15:44]: Component 2900 finished
-[07/01/25 20:18:23]: Component 3000 finished
-[07/01/25 20:21:03]: Component 3100 finished
-[07/01/25 20:23:40]: Component 3200 finished
-[07/01/25 20:26:16]: Component 3300 finished
-[07/01/25 20:28:48]: Component 3400 finished
-[07/01/25 20:31:23]: Component 3500 finished
-[07/01/25 20:33:57]: Component 3600 finished
-[07/01/25 20:36:28]: Component 3700 finished
-[07/01/25 20:38:00]: Finished conversion!
+2025-01-25 13:49:59,228 - Loading edgelist into memory...
+2025-01-25 13:53:05,068 - Beginning conversion...
+/home/labs/nyosef/eitangr/miniconda3/envs/pixelgen-scvi-1/lib/python3.11/multiprocessing/popen_fork.py:66: RuntimeWarning: Using fork() can cause Polars to deadlock in the child process.
+In addition, using fork() with Python in general is a recipe for mysterious
+deadlocks and crashes.
+
+The most likely reason you are seeing this error is because you are using the
+multiprocessing module on Linux, which uses fork() by default. This will be
+fixed in Python 3.14. Until then, you want to use the "spawn" context instead.
+
+See https://docs.pola.rs/user-guide/misc/multiprocessing/ for details.
+
+If you really know what your doing, you can silence this warning with the warning module
+or by setting POLARS_ALLOW_FORKING_THREAD=1.
+
+  self.pid = os.fork()
+2025-01-25 13:53:20,170 - Finished 0
+2025-01-25 13:53:55,725 - Finished 100
+2025-01-25 13:54:31,381 - Finished 200
+2025-01-25 13:55:07,779 - Finished 300
+2025-01-25 13:55:45,724 - Finished 400
+2025-01-25 13:56:24,214 - Finished 500
+2025-01-25 13:57:01,209 - Finished 600
+2025-01-25 13:57:38,042 - Finished 700
+2025-01-25 13:58:14,692 - Finished 800
+2025-01-25 13:58:51,974 - Finished 900
+2025-01-25 13:59:27,713 - Finished 1000
+2025-01-25 14:00:05,261 - Finished 1100
+2025-01-25 14:00:41,931 - Finished 1200
+2025-01-25 14:01:19,272 - Finished 1300
+2025-01-25 14:01:56,101 - Finished 1400
+2025-01-25 14:02:31,458 - Finished 1500
+2025-01-25 14:03:09,783 - Finished 1600
+2025-01-25 14:03:46,426 - Finished 1700
+2025-01-25 14:04:22,341 - Finished 1800
+2025-01-25 14:04:59,037 - Finished 1900
+2025-01-25 14:05:35,484 - Finished 2000
+2025-01-25 14:06:16,960 - Finished 2100
+2025-01-25 14:06:56,919 - Finished 2200
+2025-01-25 14:07:35,934 - Finished 2300
+2025-01-25 14:08:15,844 - Finished 2400
+2025-01-25 14:08:55,528 - Finished 2500
+2025-01-25 14:09:34,845 - Finished 2600
+2025-01-25 14:10:17,136 - Finished 2700
+2025-01-25 14:10:53,928 - Finished 2800
+2025-01-25 14:11:33,644 - Finished 2900
+2025-01-25 14:12:15,417 - Finished 3000
+2025-01-25 14:12:54,568 - Finished 3100
+2025-01-25 14:13:34,853 - Finished 3200
+2025-01-25 14:14:14,180 - Finished 3300
+2025-01-25 14:14:53,807 - Finished 3400
+2025-01-25 14:15:34,190 - Finished 3500
+2025-01-25 14:16:13,156 - Finished 3600
+2025-01-25 14:16:52,862 - Finished 3700
+2025-01-25 14:17:16,278 - Finished conversion!
+2025-01-25 14:17:24,603 - Writing...
+2025-01-25 14:17:37,965 - Finished, exiting!
 
 ------------------------------------------------------------
 Sender: LSF System <DoNotReply>
-Subject: Job 657239: <coloc-dataset> in cluster <wexac> Done
+Subject: Job 90445: <coloc-dataset> in cluster <wexac> Done
 
-Job <coloc-dataset> was submitted from host <login2> by user <eitangr> in cluster <wexac> at Tue Jan  7 18:58:37 2025
-Job was executed on host(s) <cn397>, in queue <medium>, as user <eitangr> in cluster <wexac> at Tue Jan  7 18:58:38 2025
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Sat Jan 25 13:49:36 2025
+Job was executed on host(s) <cn394>, in queue <medium>, as user <eitangr> in cluster <wexac> at Sat Jan 25 13:49:37 2025
 </home/labs/nyosef/eitangr> was used as the home directory.
 </home/labs/nyosef/eitangr/pixelgen> was used as the working directory.
-Started at Tue Jan  7 18:58:38 2025
-Terminated at Tue Jan  7 20:38:15 2025
-Results reported at Tue Jan  7 20:38:15 2025
+Started at Sat Jan 25 13:49:37 2025
+Terminated at Sat Jan 25 14:17:45 2025
+Results reported at Sat Jan 25 14:17:45 2025
 
 Your job looked like:
 
@@ -59,28 +76,31 @@ Your job looked like:
 # LSBATCH: User input
 #BSUB -J coloc-dataset
 #BSUB -q medium
-#BSUB -R rusage[mem=262144]
-#BSUB -R affinity[thread*4]
+#BSUB -R rusage[mem=256G]
+#BSUB -R affinity[thread*16]
 
 cd /home/labs/nyosef/eitangr/pixelgen
 conda activate pixelgen-scvi-1
 python -m PixelGen.jobs.create_coloc_dataset > PixelGen/jobs/create_coloc_dataset.out 2>&1
+
+
+# Run with: bsub < PixelGen/jobs/create_coloc_dataset.lsf -o PixelGen/jobs/create_coloc_dataset.out
 ------------------------------------------------------------
 
 Successfully completed.
 
 Resource usage summary:
 
-    CPU time :                                   5831.36 sec.
-    Max Memory :                                 98513 MB
-    Average Memory :                             8165.62 MB
+    CPU time :                                   22810.86 sec.
+    Max Memory :                                 98591 MB
+    Average Memory :                             41075.04 MB
     Total Requested Memory :                     262144.00 MB
-    Delta Memory :                               163631.00 MB
+    Delta Memory :                               163553.00 MB
     Max Swap :                                   -
-    Max Processes :                              5
-    Max Threads :                                32
-    Run time :                                   5979 sec.
-    Turnaround time :                            5978 sec.
+    Max Processes :                              21
+    Max Threads :                                65
+    Run time :                                   1688 sec.
+    Turnaround time :                            1689 sec.
 
 The output (if any) is above this job summary.
 

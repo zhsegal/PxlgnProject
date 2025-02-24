@@ -1,15 +1,18 @@
 channels:
-  - conda-forge
   - pytorch
   - nvidia
+  - conda-forge
   - bioconda
 dependencies:
   - python>=3.10
   - pytorch
-  - pytorch-cuda
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
   - ipython
   - ipykernel
   - ipywidgets
+  - jupyterlab
   - jaxlib>=0.4.3
   - matplotlib
   - numpy

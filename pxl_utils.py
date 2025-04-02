@@ -13,11 +13,12 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 import polars as pl
+from pygsp.graphs import Graph
 
 
 import scanpy as sc
 import scipy
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, coo_array
 from scipy.interpolate import griddata
 
 
@@ -54,8 +55,142 @@ def get_marker_pair_tuples(marker_names, only_diff=True, only_sorted_pairs=True)
     ordered = (lambda m1, m2: m1 < m2) if only_sorted_pairs else (lambda m1, m2: True)
     return sorted([(m1, m2) for (m1, m2) in itertools.product(marker_names, marker_names) if diff(m1, m2) and ordered(m1, m2)])
 
+
 def get_marker_pair_names(marker_names, only_diff=True, only_sorted_pairs=True):
     return [pair2str(*p) for p in get_marker_pair_tuples(marker_names, only_diff=only_diff, only_sorted_pairs=only_sorted_pairs)]
+
+
+def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_marker_counts, upib_to_marker_counts, vars, upia_s='upia_int', upib_s='upib_int'):
+    '''
+    Assumes neihborhoods are built around a pixels.
+    '''
+    upia_upib_int_unique = pd_unique_values(component_edgelist, [upia_s, upib_s], observed=True)
+    upi_connectivity = upia_unique.reset_index()[[upia_s]].rename(columns={upia_s: f'{upia_s}_0'})
+    for i in range(nbhd_radius):
+        if i % 2 == 0:
+            upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upia_s)[upib_s], on=f'{upia_s}_{i}').rename(columns={upib_s: f'{upib_s}_{i+1}'})
+        else:
+            upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upib_s)[upia_s], on=f'{upib_s}_{i}').rename(columns={upia_s:f'{upia_s}_{i+1}'})
+
+        upi_connectivity = pd_unique_values(upi_connectivity, col_names=upi_connectivity.columns.values, observed=True)
+
+    last_pixel_type = upia_s if nbhd_radius % 2 == 0 else upib_s
+    last_to_marker_counts = upia_to_marker_counts if nbhd_radius % 2 == 0 else upib_to_marker_counts
+    
+    pxl_0 = f'{upia_s}_0'
+    pxl_n = f'{last_pixel_type}_{nbhd_radius}'
+    center_pxl = f'nbhd_center_upi_int'
+    # surr_pxl = f'nbhd_surr_upi_int'
+
+
+    upi_connectivity_short = pd_unique_values(upi_connectivity, col_names=[pxl_0, pxl_n], observed=True)
+
+    nbhds_markers = upi_connectivity_short.join(last_to_marker_counts.set_index('upi_int')[['marker', 'Count']], on=pxl_n)[[pxl_0, 'marker', 'Count']].rename(
+        columns={pxl_0: center_pxl}).groupby([center_pxl, 'marker'], as_index=False, observed=True)['Count'].sum()
+    
+    # nbhds_total_counts = nbhds_markers.groupby(center_pxl, observed=True)['Count'].sum()
+
+    # upi_markers_pivoted = pd.pivot_table(base_upi_to_marker_counts, values='Count', index='upi_int', columns='marker', observed=True, fill_value=0).astype(int)
+
+    # Table showing marker counts per neighborhood (each nbhd is defined by a center pixel; neighborhoods overlap)
+    # nbhds_markers_pivoted = pd.pivot_table(nbhds_markers, values='Count', index=center_pxl, columns='marker', observed=True, fill_value=0,).astype(int)
+
+    # for marker in vars:
+    #     if marker not in nbhds_markers_pivoted.columns:
+    #         nbhds_markers_pivoted[marker] = 0
+    return {
+        'connectivity': upi_connectivity_short,
+        'nbhd_marker_counts': nbhds_markers,
+    }
+
+    
+
+
+def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, components=None, vars=None, compute_pixel_graph=False):
+    if components is None:
+        components = adata.obs_names
+    if vars is None:
+        vars = adata.var_names    
+    # counts_df = adata.to_df(count_layer)
+
+    assert pixel_type in ('a', 'b', 'both')
+
+    if nbhd_radius > 0:
+        assert pixel_type == 'a'           
+
+    print_w_time('Starting conversion...')
+    iter = tqdm(components)
+
+    pixel_counts_per_component = []
+    nbhd_counts_per_component = []
+    graph_per_component = []
+
+    for i_comp, component in enumerate(iter):
+        component_edgelist_orig = pg_edgelist[pg_edgelist['component'] == component]
+        component_edgelist_orig = component_edgelist_orig[component_edgelist_orig['marker'].isin(vars)]
+
+        n_upia_unique = component_edgelist_orig['upia'].nunique()
+        n_upib_unique = component_edgelist_orig['upib'].nunique()
+
+        upia_unique = pd.DataFrame({'upi': component_edgelist_orig['upia'].unique(), 'upi_type': 'a', 'upia_int': range(0, n_upia_unique)}).set_index('upi')
+        upib_unique = pd.DataFrame({'upi': component_edgelist_orig['upib'].unique(), 'upi_type': 'b', 'upib_int': range(n_upia_unique, n_upia_unique + n_upib_unique)}).set_index('upi')
+
+        upi_unique = pd.concat((upia_unique, upib_unique), axis=0)
+
+        component_edgelist = component_edgelist_orig.join(upia_unique['upia_int'], on='upia').join(upib_unique['upib_int'], on='upib')
+
+        if pixel_type in ('a', 'both') or nbhd_radius > 0:
+            upia_to_marker_counts = component_edgelist.groupby(['upia_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upia_int': 'upi_int'})
+            upia_to_marker_counts['type'] = 'a'
+        
+        if pixel_type in ('b', 'both') or nbhd_radius > 0:
+            upib_to_marker_counts = component_edgelist.groupby(['upib_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upib_int': 'upi_int'})
+            upib_to_marker_counts['type'] = 'b'
+        
+        if pixel_type == 'a':
+            upi_to_marker_counts = upia_to_marker_counts
+        elif pixel_type == 'b':
+            upi_to_marker_counts = upib_to_marker_counts
+        else:
+            upi_to_marker_counts = pd.concat((upia_to_marker_counts, upib_to_marker_counts), axis=0)
+        
+        upi_to_marker_counts['component'] = component
+        pixel_counts_per_component.append(upi_to_marker_counts)
+
+        if nbhd_radius > 0:
+            nbhd_counts = get_component_nbhds(component_edgelist, upia_unique=upia_unique, nbhd_radius=nbhd_radius, vars=vars,
+                                                 upia_to_marker_counts=upia_to_marker_counts, upib_to_marker_counts=upib_to_marker_counts
+                                                 )['nbhd_marker_counts']
+            nbhd_counts['component'] = component
+            nbhd_counts_per_component.append(nbhd_counts)
+        
+        if compute_pixel_graph:
+            connectivity = get_component_nbhds(component_edgelist, upia_unique=upia_unique, nbhd_radius=2, vars=vars,
+                                                 upia_to_marker_counts=upia_to_marker_counts, upib_to_marker_counts=upib_to_marker_counts
+                                                 )['connectivity']
+            edges = connectivity.rename(columns={'upia_int_0': 'a1', 'upia_int_2': 'a2'})[['a1', 'a2']]
+            edges = edges[edges['a1'] != edges['a2']]
+            n_a_pixels = len(upia_unique)
+            data = np.ones((len(edges),))
+            coords = (edges['a1'], edges['a2'])
+            edges_sparse = coo_array((data, coords), shape=(n_a_pixels, n_a_pixels))
+            graph = Graph(edges_sparse, )
+            graph_per_component.append(graph)
+
+
+
+    
+    return {
+        'pixel_counts': pd.concat(pixel_counts_per_component, axis=0, ignore_index=True),
+        'nbhd_counts': pd.concat(nbhd_counts_per_component, axis=0, ignore_index=True) if nbhd_radius > 0 else None,
+        'graphs': graph_per_component if compute_pixel_graph else None
+    }
+
+
+    
+    # marker_pair_tuples = get_marker_pair_tuples(vars, only_diff=True, only_sorted_pairs=True)
+    # marker_pair_strs = get_marker_pair_names(vars, only_diff=True, only_sorted_pairs=True) 
+
 
 def convert_edgelist_to_protein_pair_colocalization(pg_edgelist, adata, nbhd_radius=1, pxl_type='a', components=None, verbose='tqdm', 
                                                     detailed_info=False, count_layer='counts',
@@ -527,6 +662,21 @@ def add_one_hot_encoding_obsm(adata, obs_column, key_added=None):
         key_added = obs_column
     adata.obsm[obs_column] = pd.get_dummies(adata.obs[[obs_column]], dtype=int)
 
+def get_rep(adata, rep_name):
+    '''
+    Retrieves a representation from adata, checking first in layers and then in obsm.
+    If rep_name is None returns main layer.
+    '''
+    if rep_name is None:
+        rep = adata.to_df()
+    elif rep_name in adata.layers:
+        rep = adata.to_df(rep_name)
+    elif rep_name in adata.obsm:
+        rep = adata.obsm[rep_name]
+    else:
+        raise RuntimeError(f'{rep_name} not in layers or obsm')
+    return rep
+
 
 def distr_autocorrelation_in_latent(adata, latent_neighbors_connectivities_key_lst, names, distr_key, vars=None):
     '''
@@ -544,7 +694,7 @@ def distr_autocorrelation_in_latent(adata, latent_neighbors_connectivities_key_l
         existing_conn = adata.obsp.get(s_conn)
         adata.obsp[s_conn] = requested_conn
 
-        distr = adata.obsm[distr_key]
+        distr = get_rep(adata, distr_key)
         if vars is None:
             vars = distr.columns.values
         distr = distr.loc[:, vars]
@@ -640,20 +790,31 @@ def pairs_to_marginals_correlation(counts_and_coloc_df, marker_names):
         
 
 
-def calc_PCA(adata, layer=None, obsm=None, key_added=None, **kwargs):
+def calc_PCA(adata, key_added, rep=None, layer=None, obsm=None, **kwargs):
     '''
     Extends sc.pp.PCA to allow arbitrary representation for PCA and arbitrary key name to add
     Can pass any of the PCA kwargs (except copy / return_info)
+    Can pass rep instead of layer/obsm and then they will be searched (in that order)
     Note, varm['PCs'] will not be registered
+    adata will have new obsm field called {key_added}_pca and new uns field called {key_added}_pca_info
     Returns None (changes adata)
     '''
-    assert layer is None or obsm is None
-    if obsm is not None:
-        new_adata = anndata.AnnData(X=adata.obsm[obsm])
-    elif layer is not None:
-        new_adata = anndata.AnnData(X=adata.layers[layer])
+    if all((not rep, not layer, not obsm)):
+        X = adata.X
+    if rep:
+        X = adata.layers.get(rep)
+        if X is None:
+            X = adata.obsm.get(rep)
+        if X is None:
+            raise RuntimeError('rep is not in layers or obsm')
     else:
-        new_adata = anndata.AnnData(X=adata.X)
+        if all((layer, obsm)):
+            raise RuntimeError('Cannot pass both layer and obsm')
+        if layer:
+            X = adata.layers[layer]
+        else:
+            X = adata.obsm[obsm]
+    new_adata = anndata.AnnData(X=X)
     pca_data = sc.pp.pca(new_adata, copy=True, **kwargs)
     adata.obsm[f'{key_added}_pca'] = pca_data.obsm['X_pca']
     adata.uns[f'{key_added}_pca_info'] = pca_data.uns['pca']
@@ -718,7 +879,7 @@ def compute_graph_layout(pg_data, component):
     return pg_data.precomputed_layouts.filter(component_ids=[component]).to_df()
 
 
-def plot_cell_with_markers(graph_layout_data, marker_1, marker_2=None, **marker_kwargs):
+def plot_cell_with_markers(graph_layout_data, marker_1, marker_2=None, norm=True, **marker_kwargs):
     pio.renderers.default = "plotly_mimetype+notebook_connected"
 
     # --- Create the sphere surface ---
@@ -875,16 +1036,48 @@ def center_feature_matrix(arr):
     return (arr - arr.mean(axis=0)) / (arr.std(axis=0))
 
 
-def convert_polarization_to_feature_matrix(polarization, components, key='morans_i', var_suffix='pol', fill_na_with_mean=True):
+def convert_polarization_to_feature_matrix(polarization, components, vars=None, key='morans_i', var_suffix='pol', fill_na_with_mean=True, rescale=False):
     '''
     Receives polarization data in longform format (as in pixelgen datasets) and converts to a data format for usage in an anndata (obs x features)
     '''
     longform = polarization[['component', 'marker', key]]
     longform = longform[longform['component'].isin(components)]
     result = longform.pivot(index='component', columns='marker', values=key)
-    result.columns = [f'{col}_pol' for col in result.columns]
+    if vars:
+        result = result[vars]
+    if var_suffix:
+        result.columns = [f'{col}_{var_suffix}' for col in result.columns]
     if fill_na_with_mean:
         result = fill_with_mean(result)
+    if rescale:
+        result = (result + 1) / 2
+    result = result.reindex(components)
+    return result
+
+def convert_colocalization_to_feature_matrix(coloc, components, vars=None, pairs=None, key='pearson', var_suffix=None, fill_na_with_mean=True, rescale=False):
+    '''
+    Receives colocalization data in longform format (as in pixelgen datasets) and converts to a data format for usage in an anndata (obs x features)
+    If vars is not None, only vars from the list will be put into pairs and considered.
+    If pairs is not None, only pairs from the list generated (from all vars or specified vars) will be considered.
+    Note, pairs must be sorted.
+    '''
+    longform_coloc = coloc[['component', 'marker_1', 'marker_2', key]].copy()
+    if vars:
+        longform_coloc['is_var'] = longform_coloc['marker_1'].isin(vars) & longform_coloc['marker_2'].isin(vars)
+        longform_coloc = longform_coloc[longform_coloc['is_var']]
+    longform_coloc['pair'] = [pair2str(m1, m2, sort=True) for m1, m2 in zip(longform_coloc['marker_1'], longform_coloc['marker_2'])]
+    if pairs:
+        longform_coloc['is_pair'] = longform_coloc(['pair']).isin(pairs)
+        longform_coloc = longform_coloc[longform_coloc['is_pair']]
+    result = longform_coloc.pivot(index='component', columns='pair', values=key)
+    if var_suffix:
+        result.columns = [f'{col}_{var_suffix}' for col in result.columns]
+    if fill_na_with_mean:
+        result = fill_with_mean(result)
+    if rescale:
+        if key == 'pearson':
+            result = (result + 1) / 2
+    result = result.reindex(components)
     return result
 
 def get_pxl_dataset(base_url, base_dataset_dir, filenames, aggregation_sample_names):
@@ -897,6 +1090,67 @@ def get_pxl_dataset(base_url, base_dataset_dir, filenames, aggregation_sample_na
     )
     return pg_data
 
+
+def plot_histograms(adata=None, keys=None, dfs=None, names=None, vars=None, hue=None, n_cols=8, kind='kde'):
+    '''
+    Pass either adata with obsm keys, or list of dfs with same columns
+    If passing hue, hue must be an entry in adata.obs, and keys must be of length 1
+    Returns flattened axes
+    keys: obsm keys
+    kind: kde/hist
+
+    '''
+    assert dfs or all((adata, keys))
+    assert not hue or len(keys) == 1
+    if adata:
+        dfs = [adata.obsm[key] for key in keys]
+    if vars is None:
+        vars = dfs[0].columns
+    if names is None:
+        if keys:
+            names = keys
+        else:
+            names = [f'{i}' for i in range(len(dfs))]
+    n_plots = len(vars)
+    n_rows = (n_plots + n_cols - 1) // n_cols 
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 3*n_rows))
+    axes = axes.flatten()
+    if hue:
+        dfs[0] = dfs[0].copy()
+        dfs[0][hue] = adata.obs[hue]
+    for ax, var in zip(axes, vars):
+        plot_f = {'kde': sns.kdeplot, 'hist': sns.histplot}[kind]
+        kwargs = {'kde': dict(fill=True, alpha=0.5), 'hist': dict(alpha=0.5)}[kind]
+        for i, df in enumerate(dfs):
+            if hue:
+                plot_f(df, x=var, ax=ax, hue=hue, legend=(ax==axes[0]), **kwargs)
+            else:
+                plot_f(df, x=var, ax=ax, color=sns.color_palette()[i], label=names[i], **kwargs)
+        if ax == axes[0] and not hue:
+            ax.legend(loc='lower left', bbox_to_anchor=(0, 1.05))
+        # ax.set_title(var)
+    
+    fig.tight_layout()
+    return axes
+
+def arr_to_df(arr, df):
+    return pd.DataFrame(arr, index=df.index, columns=df.columns)
+
+
+def plot_mean_std(df, axis=0, ax=None, **kwargs):
+    ax = sns.scatterplot(x=df.mean(axis=axis), y=df.std(axis=axis), ax=ax, **kwargs)
+    ax.set_xlabel('Mean')
+    ax.set_ylabel('Std')
+    return ax
+
+def pca_neighbors_umap(adata, latent_name, neighbors_kwargs={}, umap_tl_kwargs={}, umap_pl_kwargs={}, umap_title=None,):
+    calc_PCA(adata, rep=latent_name, key_added=latent_name)
+    sc.pp.neighbors(adata, use_rep=f'{latent_name}_pca', key_added=latent_name, **neighbors_kwargs)
+    sc.tl.umap(adata, neighbors_key=latent_name, **umap_tl_kwargs)
+    fig = sc.pl.umap(adata, **umap_pl_kwargs, return_fig=True)
+    if umap_title:
+        fig.suptitle(umap_title)
+    return fig
 
 # coloc_key = 'jaccard'
 # longform_coloc = pg_data.colocalization[['component', 'marker_1', 'marker_2', coloc_key]].join(adata.obs['sample_class'], on='component')

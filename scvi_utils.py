@@ -15,11 +15,12 @@ def plot_losses(model):
     # pd.set_option("future.no_silent_downcasting", True)
     # validation_df.replace({'reconstruction_loss_validation': 'Reconstruction', 'kl_local_validation': 'KL'}, inplace=True)
     # train_df.replace({'reconstruction_loss_train': 'Reconstruction', 'kl_local_train': 'KL'}, inplace=True)
-    fig, ax = plt.subplots(2, 4, figsize=(15, 6), sharex=True, sharey='col')
+    fig, ax = plt.subplots(2, 5, figsize=(18, 6), sharex=True, sharey='col')
     ax[0][0].set_title('Reconstruction')
     ax[0][1].set_title('KL*Weight')
     ax[0][2].set_title('KL')
     ax[0][3].set_title('Loss')
+    ax[0][4].set_title('ELBO')
 
     n_epochs = len(model.history['validation_loss'])
 
@@ -33,7 +34,7 @@ def plot_losses(model):
 
     for i, eval_set in enumerate(('train', 'validation')):
         full_loss_key = {'validation': 'validation_loss', 'train': 'train_loss_epoch'}[eval_set]
-        for j, loss_type in enumerate(('reconstruction_loss', 'kl*weight', 'kl_local', 'full_loss')):
+        for j, loss_type in enumerate(('reconstruction_loss', 'kl*weight', 'kl_local', 'full_loss', 'elbo')):
             if loss_type == 'kl*weight':
                 if 'kl_weight' in model.history:
                     kl_weight = model.history['kl_weight']['kl_weight']

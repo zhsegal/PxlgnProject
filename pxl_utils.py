@@ -27,6 +27,15 @@ import plotly.io as pio
 from plotly import subplots
 import nbformat
 
+from PixelGen.scvi_utils import plot_losses
+from IPython.utils import io
+
+from scipy.sparse.csgraph import dijkstra
+import hotspot
+from concurrent.futures import ProcessPoolExecutor
+import logging
+import multiprocessing
+
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -106,7 +115,7 @@ def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_ma
     
 
 
-def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, components=None, vars=None, compute_pixel_graph=False):
+def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, components=None, vars=None, compute_pixel_graph=False, verbose=True):
     if components is None:
         components = adata.obs_names
     if vars is None:
@@ -118,8 +127,9 @@ def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, 
     if nbhd_radius > 0:
         assert pixel_type == 'a'           
 
-    print_w_time('Starting conversion...')
-    iter = tqdm(components)
+    if verbose:
+        print_w_time('Starting conversion...')
+    iter = tqdm(components) if verbose else components
 
     pixel_counts_per_component = []
     nbhd_counts_per_component = []
@@ -880,6 +890,10 @@ def compute_graph_layout(pg_data, component):
 
 
 def plot_cell_with_markers(graph_layout_data, marker_1, marker_2=None, norm=True, **marker_kwargs):
+    '''
+    marker_1 will be drawn as red, marker_2 as blue
+    '''
+
     pio.renderers.default = "plotly_mimetype+notebook_connected"
 
     # --- Create the sphere surface ---
@@ -1151,6 +1165,152 @@ def pca_neighbors_umap(adata, latent_name, neighbors_kwargs={}, umap_tl_kwargs={
     if umap_title:
         fig.suptitle(umap_title)
     return fig
+
+
+def train_model(adata, model_cls, setup_kwargs, model_kwargs, train_kwargs, modalities_latent_names=[], generate_loss_plots=True):
+    '''
+    modalities_latent_names: list of tuples with name of modality (combined is None, main is 'X') and name of latent to put in adata
+    '''
+    model_cls.setup_anndata(adata, **setup_kwargs)
+    model = model_cls(adata, **model_kwargs)
+    model.train(**train_kwargs)
+    if generate_loss_plots:
+        ax = plot_losses(model)
+
+    for modality, latent_name in modalities_latent_names:
+        adata.obsm[latent_name] = model.get_latent_representation(modality=modality)
+    
+    return model
+
+
+def _log(s, logger):
+    if logger:
+        logger.info(s)
+    else:
+        print(s)
+
+
+def compute_hotspot_pol_and_coloc(edgelist, adata, components, vars=None, marker_count_threshold=10, knn_neighbors=30, njobs=8, logger=None):
+    '''
+    Computes polarization and coloc based on Hotspot.
+    edgelist: pixelgen edgelist
+    adata: must have 'counts' layer
+    components: list of components to compute for
+    vars: list of vars to compute pol and coloc for (typically, all except isotype controls)
+    marker_count_threshold: only compute pol and coloc for markers with counts above this threshold
+    knn_neighbors: number of neighbors for kNN graph based on A-pixel graph
+    '''
+    
+    results = []
+
+    _log('Beginning conversion...', logger)
+
+    with ProcessPoolExecutor(max_workers=njobs) as executor:
+        futures = [
+            executor.submit(
+                _process_component, component, i, logger,
+                edgelist=edgelist,
+                adata=adata,
+                vars=vars,
+                marker_count_threshold=marker_count_threshold, 
+                knn_neighbors=knn_neighbors,
+            ) for i, component in enumerate(components)
+        ]
+        results = [future.result() for future in futures]
+        _log('Finished conversion!', logger)
+
+    all_pol, all_coloc = zip(*results)
+        
+    pol = pd.concat(all_pol, axis=0, ignore_index=True)
+    coloc = pd.concat(all_coloc, axis=0, ignore_index=True)
+
+    return pol, coloc
+
+    # all_pol = []
+    # all_coloc = []
+    # for component in tqdm(components):
+    #     try:
+    #         with io.capture_output() as captured:
+    #             comp_pol, comp_coloc = compute_hotspot_pol_and_coloc_single_component(
+    #                 edgelist=edgelist,
+    #                 adata=adata,
+    #                 component=component, 
+    #                 vars=vars,
+    #                 marker_count_threshold=marker_count_threshold, 
+    #                 knn_neighbors=knn_neighbors,
+    #             )
+    #     except Exception as e:
+    #         print(f'ERROR IN COMPONENT {component}:\n{e}')
+    #         break
+    #     all_pol.append(comp_pol)
+    #     all_coloc.append(comp_coloc)
+    # pol = pd.concat(all_pol, axis=0, ignore_index=True)
+    # coloc = pd.concat(all_coloc, axis=0, ignore_index=True)
+    # return pol, coloc
+
+def _process_component(component, idx, logger, **kwargs):
+    _log(f'Calc {idx}', logger)
+    try:
+        with io.capture_output() as captured:
+            pol, coloc = compute_hotspot_pol_and_coloc_single_component(
+                component=component, 
+                **kwargs,
+            )
+            return pol, coloc
+    except Exception as e:
+        _log(f'ERROR IN COMPONENT {component}:\n{e}', logger)
+        return pd.DataFrame(), pd.DataFrame()
+
+def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, vars=None, marker_count_threshold=10, knn_neighbors=30):
+    
+    # For graph computation pass all vars, to not disconnect the graph
+    results = get_pixel_nbhd_counts(edgelist, adata, pixel_type='a', nbhd_radius=2, 
+                                    components=[component], compute_pixel_graph=True, verbose=False, vars=None)
+    pixel_counts = results['pixel_counts']
+    pixel_counts_pivot = pd.pivot_table(pixel_counts, index='upi_int', columns='marker', values='Count', observed=True, fill_value=0).astype(int)
+    g = results['graphs'][0]
+    distances = dijkstra(g.A, directed=False, unweighted=True)
+
+    # counts_abundant = pixel_counts_pivot[abundant_markers]
+    # sizes_abundant = counts_abundant.sum(axis=1)
+    # nonempty = sizes_abundant[sizes_abundant != 0].index
+    # counts_abundant = counts_abundant.loc[nonempty]
+    # distances_abundant = distances[np.ix_(nonempty, nonempty)]
+
+    # pixel_adata = anndata.AnnData(counts_abundant)
+    # pixel_adata.obsp['dijkstra'] = distances_abundant
+    # pixel_adata.obs['total_counts'] = pixel_adata.to_df().sum(axis=1)
+
+    pixel_adata = anndata.AnnData(pixel_counts_pivot)
+    pixel_adata.obsp['dijkstra'] = distances
+    pixel_adata.obs['total_counts'] = pixel_adata.to_df().sum(axis=1)
+
+    hs = hotspot.Hotspot(
+        pixel_adata,
+        layer_key=None,
+        model='bernoulli',
+        distances_obsp_key='dijkstra',
+        umi_counts_obs_key='total_counts'
+    )
+    hs.create_knn_graph(weighted_graph=False, n_neighbors=knn_neighbors)
+    
+    hs_pol = hs.compute_autocorrelations()
+    hs_pol = hs_pol.reset_index().rename(columns={'Gene': 'marker', 'C': 'pol_hs'})
+
+    abundant_markers = [v for v in vars if adata.to_df('counts').loc[component, v] > marker_count_threshold]
+    hs_pol = hs_pol[hs_pol['marker'].isin(abundant_markers)]
+
+    local_correlations = hs.compute_local_correlations(abundant_markers)
+
+    long_coloc = hs.local_correlation_c.reset_index().melt(id_vars='marker', var_name='marker_2', value_name='coloc_hs').rename(columns={'marker': 'marker_1'})
+    long_coloc = long_coloc[long_coloc['marker_1'] != long_coloc['marker_2']]
+    long_coloc['pair_name'] = [pair2str(m1, m2, sort=True) for m1, m2 in zip(long_coloc['marker_1'], long_coloc['marker_2'])]
+    long_coloc = long_coloc.drop_duplicates(subset='pair_name')
+
+    hs_pol['component'] = component
+    long_coloc['component'] = component
+
+    return hs_pol, long_coloc
 
 # coloc_key = 'jaccard'
 # longform_coloc = pg_data.colocalization[['component', 'marker_1', 'marker_2', coloc_key]].join(adata.obs['sample_class'], on='component')

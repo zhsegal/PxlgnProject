@@ -3,6 +3,9 @@ from collections.abc import Iterable, Sequence, Iterator
 import numpy.typing as npt
 from typing import Callable, Literal, Optional, Union
 
+from enum import Enum
+from enum import auto
+
 import pyro
 import pyro.distributions as dist
 import scvi
@@ -75,50 +78,13 @@ class Sqrt(nn.Module):
     def forward(self, x):
         return torch.sqrt(x)
 
-class LinearNetWithTransform(torch.nn.Module):
-    def __init__(
-        self,
-        input_d: int,
-        hidden_d: int,
-        output_d: int,
-        n_hidden: int,
-        transform: Literal["exp", "none", "softmax"],
-    ):
-        """Encodes data of ``n_input`` dimensions into a space of ``n_output`` dimensions.
+class Dispersion(Enum):
+    GENE = auto()
+    GENE_CELL = auto()
 
-        Uses a one layer fully-connected neural network with 128 hidden nodes.
-
-        Parameters
-        ----------
-        n_input
-            The dimensionality of the input.
-        n_output
-            The dimensionality of the output.
-        link_var
-            The final non-linearity.
-        """
-        super().__init__()
-        self.neural_net = torch.nn.Sequential(
-            torch.nn.Linear(input_d, hidden_d),
-            torch.nn.ReLU(),
-            *(  [
-                    torch.nn.Linear(hidden_d, hidden_d),
-                    torch.nn.ReLU(),
-                ]*(n_hidden - 1)
-            ),
-            torch.nn.Linear(hidden_d, output_d),
-        )
-        self.transformation = None
-        if transform == "softmax":
-            self.transformation = torch.nn.Softmax(dim=-1)
-        elif transform == "exp":
-            self.transformation = torch.exp
-
-    def forward(self, x: torch.Tensor):
-        output = self.neural_net(x)
-        if self.transformation:
-            output = self.transformation(output)
-        return output
+    @classmethod
+    def from_str(cls, str):
+        return {'gene': cls.GENE, 'gene-cell': cls.GENE_CELL}[str]
 
 
 class Decoder(nn.Module):
@@ -155,6 +121,7 @@ class Decoder(nn.Module):
         n_input: int,
         n_output: int,
         distr: Literal["normal", "beta"],
+        dispersion: Literal["gene", "gene-cell"] = 'gene-cell',
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
         n_hidden: int = 128,
@@ -163,6 +130,7 @@ class Decoder(nn.Module):
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
         decoder_param_eps: float = 1e-12,
+        decoder_activation: Literal["exp", "softplus"] = 'softplus',
     ):
         super().__init__()
         self.px_decoder = FCLayers(
@@ -178,9 +146,26 @@ class Decoder(nn.Module):
         )
         self.decoder_param_eps = decoder_param_eps
 
+        self.decoder_activation = {
+            'exp': ExpEps(decoder_param_eps),
+            'softplus': SoftplusEps(decoder_param_eps),
+        }[decoder_activation]
+
         self.distr = distr
+
+        self.dispersion = Dispersion.from_str(dispersion)
+
         if distr == 'normal':
             # loc, scale decoders
+            # self.param_decoders = nn.ModuleDict(
+            #     {
+            #         'loc': nn.Linear(n_hidden, n_output),
+            #     }
+            # )
+            # if self.dispersion == Dispersion.GENE_CELL:
+            #     self.log_scale_decoder = nn.Linear(n_hidden, n_output)
+            # elif self.dispersion == Dispersion.GENE:
+            #     self.log_scale_param = nn.Parameter(torch.zeros(n_output))
             self.param_decoders = nn.ModuleDict(
                 {
                     'loc': nn.Linear(n_hidden, n_output),
@@ -191,13 +176,26 @@ class Decoder(nn.Module):
             # self.param_decoders.add_module('scale_decoder', nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps)))
         if distr == 'beta':
             # alpha, beta decoders based on torch.distributions conventions
+            # self.param_decoders = nn.ModuleDict(
+            #     {
+            #         'con1': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
+            #         'con0': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
+            #     }
+            # )   
+            # if self.dispersion == Dispersion.GENE_CELL:
+            #     self.log_scaling_factor_decoder = nn.Linear(n_hidden, n_output)
+            # elif self.dispersion == Dispersion.GENE:
+            #     self.log_scaling_factor_param = nn.Parameter(torch.zeros(n_output))
+            
             self.param_decoders = nn.ModuleDict(
                 {
                     'concentration1': nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps)),
                     'concentration0': nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps)),
                 }
             )
-            self.scaling_factor_decoder = nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(decoder_param_eps))
+            self.scaling_factor_decoder = nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps))
+            
+
             # self.param_decoders.add_module('alpha_decoder', nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps)))
             # self.param_decoders.add_module('beta_decoder', nn.Sequential(nn.Linear(n_hidden, n_output), SoftplusEps(self.decoder_param_eps)))
 
@@ -206,10 +204,36 @@ class Decoder(nn.Module):
         z: torch.Tensor,
         *cat_list: int,
     ):
-        # The decoder returns values for the parameters
         px = self.px_decoder(z, *cat_list)
 
         params = {}
+
+        # def _act(t):
+        #     return self.decoder_activation(t)
+
+        # def _expand_1d(t, other):
+        #     view_shape = [1] * (other.dim() - 1) + [t.size(0)]
+        #     return t.view(*view_shape).expand_as(other)
+
+        # for param_name, param_decoder in self.param_decoders.items():
+        #     params[param_name] = param_decoder(px)
+
+        # if self.distr == 'normal':
+        #     if self.dispersion == Dispersion.GENE:
+        #         log_scale = _expand_1d(self.log_scale_param, params['loc'])
+        #     elif self.dispersion == Dispersion.GENE_CELL:
+        #         log_scale = self.log_scale_decoder(px)
+        #     params['scale'] = _act(log_scale)
+
+        # if self.distr == 'beta':
+        #     if self.dispersion == Dispersion.GENE:
+        #         log_scaling_factor = _expand_1d(self.log_scaling_factor_param, params['con1'])
+        #     elif self.dispersion == Dispersion.GENE_CELL:
+        #         log_scaling_factor = self.log_scaling_factor_decoder(px)
+        #     scaling_factor = _act(log_scaling_factor)
+        #     for param_name in params.keys():
+        #         params[param_name] *= scaling_factor
+
 
         if self.distr == 'beta':
             scaling_factor = self.scaling_factor_decoder(px)
@@ -329,18 +353,28 @@ class MultiModalVAE(BaseModuleClass):
     Modality integration is achieved by modelling the joint latent as a weighted sum of the unimodal latents, which are each a Gaussian (hence the 
     sum too is a Gaussian)
 
-    agg_method: one of 'learned_local_avg', 'learned_global_avg', 'fixed_avg', 'moe',
+    agg_method: one of 'learned_local_avg', 'learned_global_avg', 'fixed_avg', 'moe', 'shared_encoder',
+    loss_weights: 
+        None (default) - each feature is given weight 1, regardless of modality, so that in practice each modality is weighted
+                         by the number of features
+        Iterable - custom weights given to the loss of each modality.
+        'auto' - Equivalent to passing a list where each modality is weighted by d_X / d_modality. 
+                 That is, the extra modalities are weighted by the number of features in each one, so that the total weight of each modality
+                 is equal to the total weight (e.g. number of features) of the main modality. 
+
     """
 
     def __init__(self, input_ds, latent_d, hidden_d, n_hidden, n_batch, n_modalities=1, weights=None, distrs=['normal',], 
                  dropout_rate=0.05, use_batch_norm=True, unimodal_kl=True, joint_kl=False, agg_method='learned_local_avg',
-                 external_kl_weight=1,
+                 external_kl_weight=1, loss_weights=None,
                  ):
+        
+        #TODO - allow passing kwargs to the decoders
         super().__init__()
 
 
         assert isinstance(input_ds, Sequence) and torch.all(torch.tensor([len(input_ds), len(distrs)]) == n_modalities)
-        assert agg_method in ['learned_local_avg', 'learned_global_avg', 'fixed_avg', 'moe']
+        assert agg_method in ['learned_local_avg', 'learned_global_avg', 'fixed_avg', 'moe', 'shared_encoder']
 
         self.agg_method = agg_method
         self.learn_agg = agg_method not in ['moe', 'fixed_avg']
@@ -353,6 +387,15 @@ class MultiModalVAE(BaseModuleClass):
             assert self.learn_agg
             self._weights = None
         assert all([d in ('normal', 'beta') for d in distrs])
+
+        if loss_weights is None:
+            loss_weights = torch.ones((n_modalities,))
+        elif loss_weights == 'auto':
+            loss_weights = [input_ds[0] / input_ds[i] for i in range(len(input_ds))]
+        else:
+            assert len(loss_weights) == n_modalities
+
+        self._loss_weights = torch.tensor(loss_weights, requires_grad=False)
 
         self.latent_d = latent_d
         self.n_modalities = n_modalities
@@ -379,10 +422,24 @@ class MultiModalVAE(BaseModuleClass):
 
         common_kwargs = dict(n_hidden=hidden_d, n_layers=n_hidden, use_batch_norm=use_batch_norm)
 
-        self.encoders = nn.ModuleList(
+        if self.agg_method == 'shared_encoder':
+            assert (not self.unimodal_kl) and self.joint_kl
+            self.encoders = nn.ModuleList([
+                Encoder(n_input=sum(input_ds), n_output=latent_d, dropout_rate=dropout_rate, **common_kwargs)
+            ])
+
+        else:
+            self.encoders = nn.ModuleList(
+                [
+                    Encoder(n_input=input_d, n_output=latent_d, dropout_rate=dropout_rate, **common_kwargs)
+                    for input_d in self.input_ds
+                ]
+            )
+
+        self.decoders = nn.ModuleList(
             [
-                Encoder(n_input=input_d, n_output=latent_d, dropout_rate=dropout_rate, **common_kwargs)
-                for input_d in self.input_ds
+                Decoder(n_input=latent_d, n_output=input_d, distr=distr, n_cat_list=[n_batch], dropout_rate=0, **common_kwargs)
+                for input_d, distr in zip(self.input_ds, self.distrs)            
             ]
         )
 
@@ -408,12 +465,7 @@ class MultiModalVAE(BaseModuleClass):
             # self.pooling_layer = nn.Linear(n_in=self.latent_d*self.n_modalities, n_out=self.latent_d)
 
 
-        self.decoders = nn.ModuleList(
-            [
-                Decoder(n_input=latent_d, n_output=input_d, distr=distr, n_cat_list=[n_batch], dropout_rate=0, **common_kwargs)
-                for input_d, distr in zip(self.input_ds, self.distrs)            
-            ]
-        )
+
     
     def _weighted_sum(self, tensors, weights):
         '''
@@ -483,18 +535,25 @@ class MultiModalVAE(BaseModuleClass):
 
         Runs the inference (encoder) model.
         """
-        inference_results = [
-            encoder(input) for input, encoder in zip(inputs, self.encoders)
-        ]
 
         sample_shape = (n_samples, ) if n_samples > 1 else torch.Size([])
 
+        if self.agg_method == 'shared_encoder':
+            inference_results = [
+                self.encoders[0](torch.cat(inputs, dim=-1))
+            ]
+        else:
+            inference_results = [
+                encoder(input) for input, encoder in zip(inputs, self.encoders)
+            ]
+
         for encoder_result in inference_results:
-                encoder_result['z'] = encoder_result['qz'].rsample(sample_shape=sample_shape)
+            encoder_result['z'] = encoder_result['qz'].rsample(sample_shape=sample_shape)
     
         qs, means, vars, zs = zip(*[(res['q'], res['qzm'], res['qzv'], res['z']) for res in inference_results])
         batch_size = means[0].shape[0]
         device = means[0].device
+
 
         if self.agg_method in ('fixed_avg', 'learned_global_avg', 'learned_local_avg'):
 
@@ -535,8 +594,11 @@ class MultiModalVAE(BaseModuleClass):
             else:
                 raise NotImplementedError()
         
-        else:
-            raise NotImplementedError()
+        elif self.agg_method == 'shared_encoder':
+            shared_qzm, shared_qzv, shared_z = means[0], vars[0], zs[0],
+            shared_qz = Normal(shared_qzm, shared_qzv.sqrt())
+            inference_results = None
+            weights = None
 
 
             # shared_qzm = shared_qz.mean
@@ -621,17 +683,17 @@ class MultiModalVAE(BaseModuleClass):
             kl_divergence += kl(var_post_dist, prior_dist).sum(dim=-1)
 
         if self.unimodal_kl:
-            for latent_param_dict in inference_outputs['modalities']:
+            for latent_param_dict, loss_weight in zip(inference_outputs['modalities'], self._loss_weights):
                 mod_post_dist = Normal(latent_param_dict['qzm'], torch.sqrt(latent_param_dict['qzv']))
-                kl_divergence += kl(mod_post_dist, prior_dist).sum(dim=-1)
+                kl_divergence += loss_weight*(kl(mod_post_dist, prior_dist).sum(dim=-1))
 
     
         inputs = inference_outputs['inputs']
         log_lik = 0
-        for input, distr in zip(inputs, generative_outputs['px_distrs']):
+        for input, distr, loss_weight in zip(inputs, generative_outputs['px_distrs'], self._loss_weights):
             # x = tensors[REGISTRY_KEYS.X_KEY]
             mod_log_lik = distr.log_prob(input).sum(dim=-1)
-            log_lik += mod_log_lik
+            log_lik += loss_weight*mod_log_lik
 
         elbo = log_lik - kl_weight*self.external_kl_weight*kl_divergence
         loss = torch.mean(-elbo)
@@ -650,7 +712,7 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def __init__(
         self,
         adata: AnnData,
-        n_latent: int = 10,
+        n_latent: int = 20,
         n_hidden: int = 128,
         n_layers: int = 1,
         distrs : Sequence[str] = ['normal'],
@@ -1192,5 +1254,53 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
 #             qz_v = self.var_encoder(x)
 #             # sample the latent code z
 #             pyro.sample("latent", dist.Normal(qz_m, torch.sqrt(qz_v)).to_event(1))
+
+
+
+
+# class LinearNetWithTransform(torch.nn.Module):
+#     def __init__(
+#         self,
+#         input_d: int,
+#         hidden_d: int,
+#         output_d: int,
+#         n_hidden: int,
+#         transform: Literal["exp", "none", "softmax"],
+#     ):
+#         """Encodes data of ``n_input`` dimensions into a space of ``n_output`` dimensions.
+
+#         Uses a one layer fully-connected neural network with 128 hidden nodes.
+
+#         Parameters
+#         ----------
+#         n_input
+#             The dimensionality of the input.
+#         n_output
+#             The dimensionality of the output.
+#         link_var
+#             The final non-linearity.
+#         """
+#         super().__init__()
+#         self.neural_net = torch.nn.Sequential(
+#             torch.nn.Linear(input_d, hidden_d),
+#             torch.nn.ReLU(),
+#             *(  [
+#                     torch.nn.Linear(hidden_d, hidden_d),
+#                     torch.nn.ReLU(),
+#                 ]*(n_hidden - 1)
+#             ),
+#             torch.nn.Linear(hidden_d, output_d),
+#         )
+#         self.transformation = None
+#         if transform == "softmax":
+#             self.transformation = torch.nn.Softmax(dim=-1)
+#         elif transform == "exp":
+#             self.transformation = torch.exp
+
+#     def forward(self, x: torch.Tensor):
+#         output = self.neural_net(x)
+#         if self.transformation:
+#             output = self.transformation(output)
+#         return output
 
 

@@ -1,0 +1,32 @@
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - ipython
+  - ipykernel
+  - ipywidgets
+  - jupyterlab
+  - jaxlib>=0.4.3
+  - matplotlib
+  - numpy
+  - pandas
+  - pip
+  - scvi-tools>=1.2
+  - optax=0.2.0
+  - scanpy
+  - python-igraph
+  - scikit-misc
+  - leidenalg
+  - fastp
+  # - pip
+  - pixelator=0.19
+  # - ray-tune
+  # - hyperopt
+

@@ -1,8 +1,57 @@
 import seaborn as sns
 import pandas as pd
+import anndata
 from matplotlib import pyplot as plt
 import numpy as np
 import torch
+from torch.distributions import MixtureSameFamily, Categorical
+import scanpy as sc
+
+class DistributionConcatenator:
+    """Utility class to concatenate Pytorch distributions and move them to cpu.
+
+    All distributions must be of the same type.
+    """
+
+    def __init__(self):
+        self._params = None
+        self._mixtures = []
+        self.distribution_cls = None
+        self._is_mixture = None
+
+    def store_distribution(self, dist: torch.distributions.Distribution):
+        """Add a dictionary of distributions to the concatenator.
+
+        Parameters
+        ----------
+        dist:
+            A Pytorch distribution.
+        """
+        self._is_mixture = type(dist) == MixtureSameFamily
+        dist_ = dist if not self._is_mixture else dist.component_distribution
+        if self._params is None:
+            self._params = {name: [] for name in dist_.arg_constraints.keys()}
+            self.distribution_cls = dist_.__class__
+        
+        if self._is_mixture:
+            self._mixtures.append(dist.mixture_distribution.probs)
+
+        new_params = {name: getattr(dist_, name).cpu() for name in dist_.arg_constraints.keys()}
+        for param_name, param in new_params.items():
+            self._params[param_name].append(param)
+
+    def get_concatenated_distributions(self, axis=0):
+        """Returns a concatenated `Distribution` object along the specified axis."""
+        concat_params = {key: torch.cat(value, dim=axis) for key, value in self._params.items()}
+        if self._is_mixture:
+            concat_mixture = torch.cat(self._mixtures, dim=axis)
+            return MixtureSameFamily(
+                mixture_distribution=Categorical(probs=concat_mixture),
+                component_distribution=self.distribution_cls(**concat_params)
+            )
+        return self.distribution_cls(**concat_params)
+
+
 
 def plot_losses(model):
 
@@ -59,3 +108,78 @@ def plot_losses(model):
     # ax[0].set_title('Validation')
     # ax[1].set_title('Train')
     return ax
+
+
+def calc_PCA(adata, key_added, rep=None, layer=None, obsm=None, **kwargs):
+    '''
+    Extends sc.pp.PCA to allow arbitrary representation for PCA and arbitrary key name to add
+    Can pass any of the PCA kwargs (except copy / return_info)
+    Can pass rep instead of layer/obsm and then they will be searched (in that order)
+    Note, varm['PCs'] will not be registered
+    adata will have new obsm field called {key_added}_pca and new uns field called {key_added}_pca_info
+    Returns None (changes adata)
+    '''
+    if all((not rep, not layer, not obsm)):
+        X = adata.X
+    if rep:
+        X = adata.layers.get(rep)
+        if X is None:
+            X = adata.obsm.get(rep)
+        if X is None:
+            raise RuntimeError('rep is not in layers or obsm')
+    else:
+        if all((layer, obsm)):
+            raise RuntimeError('Cannot pass both layer and obsm')
+        if layer:
+            X = adata.layers[layer]
+        else:
+            X = adata.obsm[obsm]
+    new_adata = anndata.AnnData(X=X)
+    pca_data = sc.pp.pca(new_adata, copy=True, **kwargs)
+    adata.obsm[f'{key_added}_pca'] = pca_data.obsm['X_pca']
+    adata.uns[f'{key_added}_pca_info'] = pca_data.uns['pca']
+
+
+
+def calc_hvg(adata=None, rep=None, layer=None, obsm=None, var_names=None, **kwargs):
+    '''
+    Extends sc.pp.highly_variable_genes to allow arbitrary representation (obsm)
+    Can pass any of the original kwargs (except inplace, which will always be false)
+    For the representation, can pass either adata + layer/obsm name, or adata=None and rep = array / df
+    If the representation is not a df, must pass var_names
+    Returns metric df
+    '''
+    if adata is None:
+        assert all((rep is not None, layer is None, obsm is None))
+        final_rep = rep
+    else:
+        assert rep is None
+        if obsm is not None:
+            assert layer is None
+            final_rep = adata.obsm[obsm]
+        else:
+            assert obsm is None
+            final_rep = adata.to_df(layer)
+    if type(final_rep) != pd.DataFrame:
+        if var_names is None:
+            raise ValueError('If representation is not a dataframe, must pass var names')
+        new_adata.var_names = var_names
+    new_adata = anndata.AnnData(X=final_rep)
+    metrics = sc.pp.highly_variable_genes(new_adata, inplace=False, **kwargs)
+    return metrics
+
+
+def pca_neighbors_umap(adata, latent_name, neighbors_kwargs={}, umap_tl_kwargs={}, umap_pl_kwargs={}, umap_title=None,):
+    calc_PCA(adata, rep=latent_name, key_added=latent_name)
+    sc.pp.neighbors(adata, use_rep=f'{latent_name}_pca', key_added=latent_name, **neighbors_kwargs)
+    sc.tl.umap(adata, neighbors_key=latent_name, **umap_tl_kwargs)
+    fig = sc.pl.umap(adata, **umap_pl_kwargs, return_fig=True)
+    if umap_title:
+        fig.suptitle(umap_title)
+    return fig
+
+
+def add_one_hot_encoding_obsm(adata, obs_column, key_added=None):
+    if not key_added:
+        key_added = obs_column
+    adata.obsm[obs_column] = pd.get_dummies(adata.obs[[obs_column]], dtype=int)

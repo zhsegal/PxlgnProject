@@ -69,6 +69,28 @@ def get_marker_pair_names(marker_names, only_diff=True, only_sorted_pairs=True):
     return [pair2str(*p) for p in get_marker_pair_tuples(marker_names, only_diff=only_diff, only_sorted_pairs=only_sorted_pairs)]
 
 
+def download_pxl(baseurl, filenames, sample_names, dataset_dir, dataset_full_path, force_redownload=False):
+    '''
+    baseurl: single string or list with length of filenames
+    '''
+    dataset_dir = Path(dataset_dir)
+    if os.path.exists(dataset_full_path) and not force_redownload:
+        print('Pxl file exists, reading')
+        pg_data = pixelator.read(dataset_full_path)
+    else:
+        if type(baseurl) == str:
+            baseurl = [baseurl]*len(filenames)
+        for url, filename in zip(baseurl, filenames):
+            os.system(f'curl -L -O -C - --create-dirs --output-dir {dataset_dir} {url}/{filename}')
+
+        datasets = [pixelator.read(dataset_dir / filename) for filename in filenames]
+        pg_data = pixelator.simple_aggregate(
+            sample_names, datasets
+        )
+        pg_data.save(dataset_full_path, force_overwrite=True)
+    return pg_data
+
+
 def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_marker_counts, upib_to_marker_counts, vars, upia_s='upia_int', upib_s='upib_int'):
     '''
     Assumes neihborhoods are built around a pixels.
@@ -624,53 +646,7 @@ def apply_func_to_neighbors(adata, neighbors_key, func):
     for (obs1, obs2) in tqdm(zip(neighbors_row, neighbors_col)):
         func_data.append(func(obs1, obs2))
     return csr_matrix(func_data, (neighbors_row, neighbors_col))
-
-
-def latent_to_distr_correlation(adata, latent_key_lst, names, distr_key, vars=None, n_pcs_lst=None, num_pairs=1000, seed=0):
-    '''
-    Pass n_pcs to select a number of PCs if latent_key is a PCA representation
-    '''
-    rng = np.random.default_rng(seed=seed)
-    obs_pairs = [rng.choice(len(adata.obs), size=(2,)) for _ in range(num_pairs)]
-
-    if n_pcs_lst is None:
-        n_pcs_lst = [None]*len(names)
-
-    ret = []
-
-    for (latent_key, n_pcs, name) in zip(latent_key_lst, n_pcs_lst, names):
-
-        distr = adata.obsm[distr_key]
-        latent_dists = []
-        distr_dists = []
-        latent = np.array(adata.obsm[latent_key])
-        if n_pcs is not None:
-            latent = latent[:, :n_pcs]
-        if vars is None:
-            vars = distr.columns.values
-        distr = distr.loc[:, vars]
-
-        distr = np.array(distr)
-
-        for obs1, obs2 in obs_pairs:
-            latent_dists.append(np.linalg.norm(latent[obs1, :] - latent[obs2, :]))
-            distr_dists.append(np.linalg.norm(distr[obs1, :] - distr[obs2, :]))
-        
-        ret.append(
-            {
-                'Latent': name,
-                'Corr': scipy.stats.pearsonr(latent_dists, distr_dists)[0],
-            }
-        )
-    
-    return pd.DataFrame(ret)
          
-
-
-def add_one_hot_encoding_obsm(adata, obs_column, key_added=None):
-    if not key_added:
-        key_added = obs_column
-    adata.obsm[obs_column] = pd.get_dummies(adata.obs[[obs_column]], dtype=int)
 
 def get_rep(adata, rep_name):
     '''
@@ -686,83 +662,6 @@ def get_rep(adata, rep_name):
     else:
         raise RuntimeError(f'{rep_name} not in layers or obsm')
     return rep
-
-
-def distr_autocorrelation_in_latent(adata, latent_neighbors_connectivities_key_lst, names, distr_key, vars=None):
-    '''
-    type = morans or gearys
-    vars: list of vars to include in computation in distr_key
-    '''
-    ret = []
-
-
-    for (neighbors_key, name) in zip(latent_neighbors_connectivities_key_lst, names):
-
-        # Need to work around the fact that use_graph is not supported in anndata
-        s_conn = 'connectivities'
-        requested_conn = adata.obsp[neighbors_key]
-        existing_conn = adata.obsp.get(s_conn)
-        adata.obsp[s_conn] = requested_conn
-
-        distr = get_rep(adata, distr_key)
-        if vars is None:
-            vars = distr.columns.values
-        distr = distr.loc[:, vars]
-        distr = distr.to_numpy().T
-
-        autocorr = pd.DataFrame(
-            {
-                'morans': sc.metrics.morans_i(adata, vals=distr),
-                'gearys': sc.metrics.gearys_c(adata, vals=distr),
-                'latent': name,
-            },
-            index=vars,
-        )
-
-        if existing_conn is not None:
-            adata.obsp[s_conn] = existing_conn
-        
-        ret.append(autocorr)
-
-    return pd.concat(ret, axis=0)
-
-
-def significant_hits_by_cluster_size(adata, neighbors_key_lst, latent_name_lst, distr_key):
-    '''
-    neighbors_key_lst: neighbor keys to compare
-    latent_name_lst: name of latent space for each neighbor key
-    adata: adata including neighbors_key with which to cluster
-    distr_key: obsm key to calculate the rank genes group on
-    '''
-    adata = adata.copy()
-    distr_adata = anndata.AnnData(X=adata.obsm[distr_key], obs=adata.obs)
-    distr_adata.var_names = adata.obsm[distr_key].columns.values
-    resolution_range = np.arange(0.2, 2, 0.1)
-    de = []
-    for latent_name, neighbors_key in zip(latent_name_lst, neighbors_key_lst):
-        print(f'Computing for {latent_name} for a range of resolutions...')
-        for r in tqdm(resolution_range):
-            leiden_key = f'leiden_{latent_name}_{r:.1f}'
-            de_key = f'de_{latent_name}_{r:.1f}'
-            sc.tl.leiden(adata, resolution=r, random_state=0, n_iterations=-1, 
-                        key_added=leiden_key, flavor='leidenalg', neighbors_key=neighbors_key, copy=False)
-
-
-            n_clusters = adata.obs[leiden_key].nunique()
-            distr_adata.obs = distr_adata.obs.join(adata.obs[leiden_key])
-            sc.tl.rank_genes_groups(distr_adata, groupby=leiden_key, method='wilcoxon', key_added=de_key)
-            significant_hits_df = sc.get.rank_genes_groups_df(distr_adata, group=None, key=de_key, pval_cutoff=0.05)
-            de.append(
-                {
-                    'Model': latent_name,
-                    'n_clusters': n_clusters,
-                    'resolution': r,
-                    'n_significant_hits' : len(significant_hits_df)
-                }
-            )
-
-    de_df = pd.DataFrame(de)
-    return de_df
 
 
 def multiple_correlation(df, vars, target):
@@ -798,64 +697,6 @@ def pairs_to_marginals_correlation(counts_and_coloc_df, marker_names):
         m2_means.append(means[m2])
     return pd.DataFrame({'R2': coeff, 'm1_mean_counts': m1_means, 'm2_mean_counts': m2_means}, index=pair_names)
         
-
-
-def calc_PCA(adata, key_added, rep=None, layer=None, obsm=None, **kwargs):
-    '''
-    Extends sc.pp.PCA to allow arbitrary representation for PCA and arbitrary key name to add
-    Can pass any of the PCA kwargs (except copy / return_info)
-    Can pass rep instead of layer/obsm and then they will be searched (in that order)
-    Note, varm['PCs'] will not be registered
-    adata will have new obsm field called {key_added}_pca and new uns field called {key_added}_pca_info
-    Returns None (changes adata)
-    '''
-    if all((not rep, not layer, not obsm)):
-        X = adata.X
-    if rep:
-        X = adata.layers.get(rep)
-        if X is None:
-            X = adata.obsm.get(rep)
-        if X is None:
-            raise RuntimeError('rep is not in layers or obsm')
-    else:
-        if all((layer, obsm)):
-            raise RuntimeError('Cannot pass both layer and obsm')
-        if layer:
-            X = adata.layers[layer]
-        else:
-            X = adata.obsm[obsm]
-    new_adata = anndata.AnnData(X=X)
-    pca_data = sc.pp.pca(new_adata, copy=True, **kwargs)
-    adata.obsm[f'{key_added}_pca'] = pca_data.obsm['X_pca']
-    adata.uns[f'{key_added}_pca_info'] = pca_data.uns['pca']
-
-
-def calc_hvg(adata=None, rep=None, layer=None, obsm=None, var_names=None, **kwargs):
-    '''
-    Extends sc.pp.highly_variable_genes to allow arbitrary representation (obsm)
-    Can pass any of the original kwargs (except inplace, which will always be false)
-    For the representation, can pass either adata + layer/obsm name, or adata=None and rep = array / df
-    If the representation is not a df, must pass var_names
-    Returns metric df
-    '''
-    if adata is None:
-        assert all((rep is not None, layer is None, obsm is None))
-        final_rep = rep
-    else:
-        assert rep is None
-        if obsm is not None:
-            assert layer is None
-            final_rep = adata.obsm[obsm]
-        else:
-            assert obsm is None
-            final_rep = adata.to_df(layer)
-    if type(final_rep) != pd.DataFrame:
-        if var_names is None:
-            raise ValueError('If representation is not a dataframe, must pass var names')
-        new_adata.var_names = var_names
-    new_adata = anndata.AnnData(X=final_rep)
-    metrics = sc.pp.highly_variable_genes(new_adata, inplace=False, **kwargs)
-    return metrics
 
 def fill_with_mean(arr):
     '''
@@ -1157,14 +998,10 @@ def plot_mean_std(df, axis=0, ax=None, **kwargs):
     ax.set_ylabel('Std')
     return ax
 
-def pca_neighbors_umap(adata, latent_name, neighbors_kwargs={}, umap_tl_kwargs={}, umap_pl_kwargs={}, umap_title=None,):
-    calc_PCA(adata, rep=latent_name, key_added=latent_name)
-    sc.pp.neighbors(adata, use_rep=f'{latent_name}_pca', key_added=latent_name, **neighbors_kwargs)
-    sc.tl.umap(adata, neighbors_key=latent_name, **umap_tl_kwargs)
-    fig = sc.pl.umap(adata, **umap_pl_kwargs, return_fig=True)
-    if umap_title:
-        fig.suptitle(umap_title)
-    return fig
+
+def get_model_latents(adata, model, modalities_latent_names):
+    for modality, latent_name in modalities_latent_names:
+        adata.obsm[latent_name] = model.get_latent_representation(modality=modality)
 
 
 def train_model(adata, model_cls, setup_kwargs, model_kwargs, train_kwargs, modalities_latent_names=[], generate_loss_plots=True):
@@ -1176,9 +1013,6 @@ def train_model(adata, model_cls, setup_kwargs, model_kwargs, train_kwargs, moda
     model.train(**train_kwargs)
     if generate_loss_plots:
         ax = plot_losses(model)
-
-    for modality, latent_name in modalities_latent_names:
-        adata.obsm[latent_name] = model.get_latent_representation(modality=modality)
     
     return model
 
@@ -1341,3 +1175,40 @@ def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, v
 #     sc.pl.umap(cur_adata, color=['sample', 'cell_type', 'low_res_cell_type', 'CD8'], wspace=0.4, return_fig=True)
 # resting_adata.write_h5ad('/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/resting_data_with_scores_annotated.h5ad')
 # stim_adata.write_h5ad('/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/stim_data_with_scores_annotated.h5ad')
+
+# def significant_hits_by_cluster_size(adata, neighbors_key_lst, latent_name_lst, distr_key):
+#     '''
+#     neighbors_key_lst: neighbor keys to compare
+#     latent_name_lst: name of latent space for each neighbor key
+#     adata: adata including neighbors_key with which to cluster
+#     distr_key: obsm key to calculate the rank genes group on
+#     '''
+#     adata = adata.copy()
+#     distr_adata = anndata.AnnData(X=adata.obsm[distr_key], obs=adata.obs)
+#     distr_adata.var_names = adata.obsm[distr_key].columns.values
+#     resolution_range = np.arange(0.2, 2, 0.1)
+#     de = []
+#     for latent_name, neighbors_key in zip(latent_name_lst, neighbors_key_lst):
+#         print(f'Computing for {latent_name} for a range of resolutions...')
+#         for r in tqdm(resolution_range):
+#             leiden_key = f'leiden_{latent_name}_{r:.1f}'
+#             de_key = f'de_{latent_name}_{r:.1f}'
+#             sc.tl.leiden(adata, resolution=r, random_state=0, n_iterations=-1, 
+#                         key_added=leiden_key, flavor='leidenalg', neighbors_key=neighbors_key, copy=False)
+
+
+#             n_clusters = adata.obs[leiden_key].nunique()
+#             distr_adata.obs = distr_adata.obs.join(adata.obs[leiden_key])
+#             sc.tl.rank_genes_groups(distr_adata, groupby=leiden_key, method='wilcoxon', key_added=de_key)
+#             significant_hits_df = sc.get.rank_genes_groups_df(distr_adata, group=None, key=de_key, pval_cutoff=0.05)
+#             de.append(
+#                 {
+#                     'Model': latent_name,
+#                     'n_clusters': n_clusters,
+#                     'resolution': r,
+#                     'n_significant_hits' : len(significant_hits_df)
+#                 }
+#             )
+
+#     de_df = pd.DataFrame(de)
+#     return de_df

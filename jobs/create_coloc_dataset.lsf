@@ -1,12 +1,25 @@
+#!/bin/bash
+
+# To run:
+# conda activate pixelgen-scvi
+# ./PixelGen/jobs/create_coloc_dataset.sh ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+
 #BSUB -J coloc-dataset
 #BSUB -q long-gpu
 #BSUB -R rusage[mem=512G]
 #BSUB -gpu num=1:j_exclusive=yes:gmem=32G
 #BSUB -R affinity[thread*16]
 
+PXL_FILE="$1"
+OUTPUT_NAME="$2"
+N_THREADS="$3"   # Recommended: 16
+TEST_MODE="$4"   # "True" for debugging
+
 cd /home/projects/nyosef/eitangr/pixelgen
-conda activate pixelgen-scvi-
-python -m PixelGen.jobs.create_coloc_dataset > PixelGen/jobs/create_coloc_dataset.out 2>&1
 
+if [ "$TEST_MODE" = "True" ]; then
+	python -m PixelGen.jobs.create_coloc_dataset --pxl-file "${PXL_FILE}" --output-name "${OUTPUT_NAME}" --n-threads "${N_THREADS}" --test-mode > PixelGen/jobs/create_coloc_dataset_py.out 2>&1
+else
+	python -m PixelGen.jobs.create_coloc_dataset --pxl-file "${PXL_FILE}" --output-name "${OUTPUT_NAME}" --n-threads "${N_THREADS}" > PixelGen/jobs/create_coloc_dataset_py.out 2>&1
+fi
 
-# Run with: bsub < PixelGen/jobs/create_coloc_dataset.lsf -o PixelGen/jobs/create_coloc_dataset.out

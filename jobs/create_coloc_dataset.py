@@ -4,20 +4,56 @@ import pixelator
 from pixelator.statistics import clr_transformation
 from concurrent.futures import ProcessPoolExecutor
 import logging
+import argparse
 from pathlib import Path
 import os
 import contextlib
 
-# Run from parent directory of PixelGen with python -m PixelGen.jobs.create_coloc_dataset
+ISOTYPE_CONTROLS=['mIgG1', 'mIgG2a', 'mIgG2b']
+MARKER_COUNT_THRESHOLD = 10
+KNN_NEIGHBORS = 30
 
-DATASET_DIR = Path('PixelGen/datasets/technote-cart-fmc63-v2.0')
-DATASET = DATASET_DIR / 'carT_combined.pxl'
-NEW_DATASET = DATASET_DIR / 'carT_combined_with_hs.h5ad'
-N_THREADS = 16
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Script to compute Hotspot polarization & colocalization from a Pixelgen MPX dataset. Run from parent directory of PixelGen with python -m PixelGen.jobs.create_coloc_dataset <args>"
+    )
+    
+    parser.add_argument(
+        '--pxl-file',
+        type=Path,
+        help="Path to pxl file inside a dataset directory",
+        required=True,
+    )
 
-TEST_MODE = False
-TOY_EDGELIST_DIR = DATASET_DIR / 'toy_edgelist.csv'
-TEST_NEW_DATASET = DATASET_DIR / 'TEST_carT_combined_with_hs.h5ad'
+    parser.add_argument(
+        '--output-name',
+        type=str,
+        help='New dataset will be saved at <dataset_dir>/<output_name>.h5ad where <dataset_dir> is inferred from pxl_file',
+        required=True,
+    )
+    
+    parser.add_argument(
+        '--n-threads',
+        type=int,
+        default=16,
+    )
+    
+    parser.add_argument(
+        '--test-mode',
+        type=bool,
+        default=False,
+        help="For debugging"
+    )
+    
+    return parser.parse_args()
+
+# DATASET_DIR = Path('PixelGen/datasets/technote-cart-fmc63-v2.0')
+# DATASET = DATASET_DIR / 'carT_combined.pxl'
+# NEW_DATASET = DATASET_DIR / 'carT_combined_with_hs.h5ad'
+# N_THREADS = 16
+
+# TEST_MODE = False
+
 
 
 if __name__ == '__main__':
@@ -25,6 +61,16 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
+
+    args = parse_args()
+    DATASET = args.pxl_file
+    DATASET_DIR = args.pxl_file.parent
+    TEST_MODE = args.test_mode
+    NEW_DATASET = DATASET_DIR / f'{args.output_name}.h5ad'
+    N_THREADS = args.n_threads
+    TEST_EDGELIST_DIR = DATASET_DIR / 'toy_edgelist.csv'
+    TEST_NEW_DATASET = DATASET_DIR / f'TEST_{args.output_name}.h5ad'
+
 
     pg_data = pixelator.read(DATASET)
     adata = pg_data.adata
@@ -41,33 +87,34 @@ if __name__ == '__main__':
     logger.info(f'Total # Components: {len(components)}')
 
 
-    isotype_controls=['mIgG1', 'mIgG2a', 'mIgG2b']
-    non_isotype_vars = [var for var in adata.var_names if var not in isotype_controls]
+    non_isotype_vars = [var for var in adata.var_names if var not in ISOTYPE_CONTROLS]
 
     if TEST_MODE:
         logger.info('TEST_MODE = True')
         components = components[:100]
-        if not os.path.exists(TOY_EDGELIST_DIR):
+        if not os.path.exists(TEST_EDGELIST_DIR):
             logger.info('Toy edgelist does not exist. Creating...')
 
-            logger.info('Loading full edgelist into memory...')
+            logger.info('Loading full edgelist into memory (this could take a few minutes)...')
             edgelist = pg_data.edgelist
 
-            toy_edgelist = edgelist.iloc[:100]
-            toy_edgelist.to_csv(TOY_EDGELIST_DIR)
+            components = edgelist['component'].unique()[:10]
+
+            toy_edgelist = edgelist[edgelist['component'].isin(components)]
+            toy_edgelist.to_csv(TEST_EDGELIST_DIR)
         else:
-            toy_edgelist = pd.read_csv(TOY_EDGELIST_DIR)
+            toy_edgelist = pd.read_csv(TEST_EDGELIST_DIR)
         
         edgelist = toy_edgelist
     
     else:
-        logger.info('Loading full edgelist into memory...')
+        logger.info('Loading full edgelist into memory (this could take a few minutes)...')
         edgelist = pg_data.edgelist
 
         # Do some op to load into memory for sure
         _ = edgelist[edgelist['component'] == edgelist['component'].iloc[0]]
 
-    kwargs = dict(edgelist=edgelist, adata=adata, vars=non_isotype_vars, marker_count_threshold=10, knn_neighbors=30)
+    kwargs = dict(edgelist=edgelist, adata=adata, vars=non_isotype_vars, marker_count_threshold=MARKER_COUNT_THRESHOLD, knn_neighbors=KNN_NEIGHBORS)
 
     def _process_component(component, idx):
         logger.info(f'Calc {idx}')
@@ -102,110 +149,3 @@ if __name__ == '__main__':
 
         save_dir = NEW_DATASET if not TEST_MODE else TEST_NEW_DATASET
         adata.write_h5ad(save_dir)
-
-# with ProcessPoolExecutor(max_workers=njobs) as executor:
-#     futures = [
-#         executor.submit(
-#             _process_component, component, i, logger,
-#             edgelist=edgelist,
-#             adata=adata,
-#             vars=vars,
-#             marker_count_threshold=marker_count_threshold, 
-#             knn_neighbors=knn_neighbors,
-#         ) for i, component in enumerate(components)
-#     ]
-#     results = [future.result() for future in futures]
-#     _log('Finished conversion!', logger)
-
-
-# pol, coloc = compute_hotspot_pol_and_coloc(
-#     edgelist=edgelist, 
-#     adata=adata, 
-#     components=components, 
-#     vars=non_isotype_vars, 
-#     marker_count_threshold=10, 
-#     knn_neighbors=30, 
-#     njobs=16, 
-#     logger=logger,
-# )
-
-# adata.uns['pol_hs'] = pol
-# adata.uns['coloc_hs'] = coloc
-
-# adata.write_h5ad(NEW_DATASET)
-
-# ungrouped_marker_coloc = pxl_utils.convert_edgelist_to_protein_pair_colocalization(pg_data=pg_data, nbhd_radius=2, group_markers=False, verbose=verbose, components=components)
-
-# adata.obsm['grouped_marker_coloc'] = grouped_marker_coloc
-# adata.obsm['ungrouped_marker_coloc'] = ungrouped_marker_coloc
-
-# adata.uns['coloc_datasets'] = {
-#     'grouped_marker_coloc': dict(nbhd_size=2, group_markers=True),
-#     'ungrouped_marker_coloc': dict(nbhd_size=2, group_markers=False),
-# }
-
-# logger.info('Loading edgelist into memory...')
-
-# pg_edgelist = pg_data.edgelist
-# # Do some op to load into memory
-# _ = pg_edgelist[pg_edgelist['component'] == pg_edgelist['component'].iloc[0]]
-
-
-# def process_component(component, idx):
-#     result = convert_edgelist_to_protein_pair_colocalization(pg_edgelist=pg_edgelist, adata=adata, nbhd_radius=1, pxl_type='b',
-#                                                              verbose=False, components=[component], 
-#                                                             count_layer='counts', detailed_info=False,
-#                                                             score_types=('autocorr', 'coloc'))
-#     if idx % verbose == 0:
-#         logger.info(f'Finished {idx}')
-    
-#     return result
-
-
-# results = []
-# logger.info('Beginning conversion...')
-
-# with ProcessPoolExecutor(max_workers=N_THREADS) as executor:
-#     results = list(executor.map(process_component, components, range(len(components))))
-#     logger.info('Finished conversion!')
-
-#     for score_type, score_dict in results[0]['results'].items():
-#         for layer_name, layer in score_dict.items():
-#             adata.obsm[f'{score_type}_{layer_name}'] = pd.concat(
-#                 [res['results'][score_type][layer_name] for res in results], axis=0
-#             )
-    
-#     # adata.obsm['counts_and_coloc'] = pd.concat((adata.to_df(layer='counts'), adata.obsm['coloc']), axis=1)
-#     # adata.obsm['counts_and_z_coloc'] = pd.concat((adata.to_df(layer='counts'), adata.obsm['z_coloc']), axis=1)
-
-#     adata.uns['coloc_info'] = results[0].info
-
-#     logger.info('Writing...')
-#     adata.write_h5ad(NEW_DATASET)
-
-#     logger.info('Finished, exiting!')
-
-
-
-# marker_pair_coloc = pxl_utils.
-
-# adata.obsm['coloc_raw'] = marker_pair_coloc.layers['coloc']
-# adata.obsm['expected_coloc'] = marker_pair_coloc.layers['expected_coloc']
-# adata.obsm['variance_coloc'] = marker_pair_coloc.layers['variance_coloc']
-# adata.obsm['z_coloc'] = marker_pair_coloc.layers['z_coloc']
-
-# adata.obsm['counts_and_coloc_raw'] = pd.concat((adata.to_df(layer='counts'), adata.obsm['coloc_raw']), axis=1)
-# adata.obsm['counts_and_z_coloc'] = pd.concat((adata.to_df(layer='counts'), adata.obsm['z_coloc']), axis=1)
-# # adata.obsm['clr_by_ab_and_z_coloc'] = pd.concat((clr_transformation(adata.to_df(layer='counts'), axis=0), adata.obsm['z_coloc']), axis=1)
-# # adata.obsm['clr_by_cell_and_z_coloc'] = pd.concat((clr_transformation(adata.to_df(layer='counts'), axis=1), adata.obsm['z_coloc']), axis=1)
-
-# adata.uns['coloc_info'] = marker_pair_coloc.info
-
-# # adata.obsm['marker_pair_intersection'] = grouped_marker_coloc.marker_pair_intersection
-# # adata.obsm['marker_pair_union'] = grouped_marker_coloc.marker_pair_union
-# # adata.uns['marker_pair_names_tuples'] = grouped_marker_coloc.marker_pair_names_tuples
-# adata.write_h5ad(NEW_DATASET)
-
-
-# Not saving adata with the changes, probably pixelator bug
-# pg_data.save(NEW_DATASET, force_overwrite=True)

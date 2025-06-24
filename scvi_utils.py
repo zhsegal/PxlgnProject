@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from torch.distributions import MixtureSameFamily, Categorical
 import scanpy as sc
+from tqdm import tqdm
+from scipy.sparse import csr_matrix
 
 class DistributionConcatenator:
     """Utility class to concatenate Pytorch distributions and move them to cpu.
@@ -54,16 +56,6 @@ class DistributionConcatenator:
 
 
 def plot_losses(model):
-
-    # n_epochs = len(model.history['validation_loss'])
-    # validation_losses = ['reconstruction_loss_validation', 'kl_local_validation']
-    # training_losses = ['reconstruction_loss_train', 'kl_local_train']
-
-    # validation_df = pd.melt(pd.DataFrame({l: model.history[l][l] for l in validation_losses}).reset_index(), id_vars=['epoch'], value_name='Loss', var_name='Loss Type')
-    # train_df = pd.melt(pd.DataFrame({l: model.history[l][l] for l in training_losses}).reset_index(), id_vars=['epoch'], value_name='Loss', var_name='Loss Type')
-    # pd.set_option("future.no_silent_downcasting", True)
-    # validation_df.replace({'reconstruction_loss_validation': 'Reconstruction', 'kl_local_validation': 'KL'}, inplace=True)
-    # train_df.replace({'reconstruction_loss_train': 'Reconstruction', 'kl_local_train': 'KL'}, inplace=True)
     fig, ax = plt.subplots(2, 5, figsize=(18, 6), sharex=True, sharey='col')
     ax[0][0].set_title('Reconstruction')
     ax[0][1].set_title('KL*Weight')
@@ -73,13 +65,6 @@ def plot_losses(model):
 
     n_epochs = len(model.history['validation_loss'])
 
-    # if 'kl_weight' in model.history:
-    #     kl_weight = model.history['kl_weight']
-    # else:
-    #     if kl_warmup == 0:
-    #         kl_weight = torch.ones(shape=(n_epochs,))
-    #     else:
-    #         kl_weight = np.arange(start=0)
 
     for i, eval_set in enumerate(('train', 'validation')):
         full_loss_key = {'validation': 'validation_loss', 'train': 'train_loss_epoch'}[eval_set]
@@ -103,10 +88,6 @@ def plot_losses(model):
     
         ax[i][0].set_ylabel(eval_set)
 
-    # sns.lineplot(validation_df, x='epoch', y='Loss', hue='Loss Type', ax=ax[0])
-    # sns.lineplot(train_df, x='epoch', y='Loss', hue='Loss Type', ax=ax[1])
-    # ax[0].set_title('Validation')
-    # ax[1].set_title('Train')
     return ax
 
 
@@ -183,3 +164,89 @@ def add_one_hot_encoding_obsm(adata, obs_column, key_added=None):
     if not key_added:
         key_added = obs_column
     adata.obsm[obs_column] = pd.get_dummies(adata.obs[[obs_column]], dtype=int)
+
+
+def apply_func_to_neighbors(adata, neighbors_key, func):
+    '''
+    Receives adata with a obsp connectivities sparse matrix.
+    Applies func between each pair of neighbors, and returns a matrix M with the same structure but M_ij = func(obs_i, obs_j) for neighboring observations.
+    Func receives two observation indices and returns a scalar.
+    '''
+    neighbors_row, neighbors_col = adata.obsp[f'{neighbors_key}_distances'].nonzero()
+    func_data = []
+    for (obs1, obs2) in tqdm(zip(neighbors_row, neighbors_col)):
+        func_data.append(func(obs1, obs2))
+    return csr_matrix(func_data, (neighbors_row, neighbors_col))
+         
+
+def get_rep(adata, rep_name):
+    '''
+    Retrieves a representation from adata, checking first in layers and then in obsm.
+    If rep_name is None returns main layer.
+    '''
+    if rep_name is None:
+        rep = adata.to_df()
+    elif rep_name in adata.layers:
+        rep = adata.to_df(rep_name)
+    elif rep_name in adata.obsm:
+        rep = adata.obsm[rep_name]
+    else:
+        raise RuntimeError(f'{rep_name} not in layers or obsm')
+    return rep
+
+
+def plot_histograms(adata=None, keys=None, dfs=None, names=None, vars=None, hue=None, n_cols=8, kind='kde'):
+    '''
+    Plots feature histograms of an adata.
+    Pass either adata with obsm keys, or list of dfs with same columns (and matching list of names)
+    vars: features to plot.
+    If passing hue, hue must be an entry in adata.obs, and keys must be of length 1
+    Returns flattened axes
+    keys: obsm keys
+    kind: kde/hist
+
+    '''
+    assert dfs or all((adata, keys))
+    assert not hue or len(keys) == 1
+    if adata:
+        dfs = [adata.obsm[key] for key in keys]
+    if vars is None:
+        vars = dfs[0].columns
+    if names is None:
+        if keys:
+            names = keys
+        else:
+            names = [f'{i}' for i in range(len(dfs))]
+    n_plots = len(vars)
+    n_rows = (n_plots + n_cols - 1) // n_cols 
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 3*n_rows))
+    axes = axes.flatten()
+    if hue:
+        dfs[0] = dfs[0].copy()
+        dfs[0][hue] = adata.obs[hue]
+    for ax, var in zip(axes, vars):
+        plot_f = {'kde': sns.kdeplot, 'hist': sns.histplot}[kind]
+        kwargs = {'kde': dict(fill=True, alpha=0.5), 'hist': dict(alpha=0.5)}[kind]
+        for i, df in enumerate(dfs):
+            if hue:
+                plot_f(df, x=var, ax=ax, hue=hue, legend=(ax==axes[0]), **kwargs)
+            else:
+                plot_f(df, x=var, ax=ax, color=sns.color_palette()[i], label=names[i], **kwargs)
+        if ax == axes[0] and not hue:
+            ax.legend(loc='lower left', bbox_to_anchor=(0, 1.05))
+        # ax.set_title(var)
+    
+    fig.tight_layout()
+    return axes
+
+
+def plot_cumulative_variance(adata, pca_info_key='pca', ax=None, n_pcs=None, title=None):
+    if ax is None:
+        fig, ax = plt.subplots(1)
+    var_ratio_accum = np.cumsum(adata.uns[pca_info_key]['variance_ratio'])
+    if n_pcs is None:
+        n_pcs = len(var_ratio_accum)
+    sns.scatterplot(x=list(range(1, n_pcs + 1)), y=var_ratio_accum, ax=ax)
+    title = title if title is not None else 'Cumulative Variance Explained'
+    ax.set_title(title)
+    return ax

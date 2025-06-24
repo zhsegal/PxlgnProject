@@ -28,6 +28,9 @@ from plotly import subplots
 import nbformat
 
 from PixelGen.scvi_utils import plot_losses
+from PixelGen.common_utils import pd_unique_values, print_w_time, pair2str, str2pair, get_marker_pairs, \
+    multiple_correlation, log, fill_with_mean 
+
 from IPython.utils import io
 
 from scipy.sparse.csgraph import dijkstra
@@ -36,37 +39,6 @@ from concurrent.futures import ProcessPoolExecutor
 import logging
 import multiprocessing
 
-
-class dotdict(dict):
-    """dot.notation access to dictionary attributes"""
-    __getattr__ = dict.get
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-
-
-def print_w_time(s):
-    print(f'[{datetime.datetime.now().strftime("%d/%m/%y %H:%M:%S")}]: {s}', flush=True)
-
-def pd_unique_values(df, col_names, observed, **kwargs):
-    # return df.groupby(col_names, as_index=False, observed=observed, **kwargs)[col_names].last()
-    return df.drop_duplicates(subset=col_names, keep='first', inplace=False, ignore_index=True)[col_names]
-
-def pair2str(marker_1, marker_2, sort=False):
-    if sort:
-        marker_1, marker_2 = sorted([marker_1, marker_2])
-    return f'({marker_1},{marker_2})'
-
-def str2pair(p):
-    return p.strip('()').split(',')
-
-def get_marker_pair_tuples(marker_names, only_diff=True, only_sorted_pairs=True):
-    diff = (lambda m1, m2 : m1 != m2) if only_diff else (lambda m1, m2: True)
-    ordered = (lambda m1, m2: m1 < m2) if only_sorted_pairs else (lambda m1, m2: True)
-    return sorted([(m1, m2) for (m1, m2) in itertools.product(marker_names, marker_names) if diff(m1, m2) and ordered(m1, m2)])
-
-
-def get_marker_pair_names(marker_names, only_diff=True, only_sorted_pairs=True):
-    return [pair2str(*p) for p in get_marker_pair_tuples(marker_names, only_diff=only_diff, only_sorted_pairs=only_sorted_pairs)]
 
 
 def download_pxl(baseurl, filenames, sample_names, dataset_dir, dataset_full_path, force_redownload=False):
@@ -91,9 +63,12 @@ def download_pxl(baseurl, filenames, sample_names, dataset_dir, dataset_full_pat
     return pg_data
 
 
-def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_marker_counts, upib_to_marker_counts, vars, upia_s='upia_int', upib_s='upib_int'):
+def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, 
+                        upia_to_marker_counts, upib_to_marker_counts, vars, upia_s='upia_int', upib_s='upib_int'):
     '''
-    Assumes neihborhoods are built around a pixels.
+    This is essentially an inner function, it is recommended to use get_pixel_nbhd_counts(compute_pixel_graph=True)
+    Receives an A-B pixel bipartite graph (in the form of an edgelist), and returns the edgelist of the neighborhood graph of A pixels,
+    with a given nbhd_radius, and the counts of markers per neighborhood.
     '''
     upia_upib_int_unique = pd_unique_values(component_edgelist, [upia_s, upib_s], observed=True)
     upi_connectivity = upia_unique.reset_index()[[upia_s]].rename(columns={upia_s: f'{upia_s}_0'})
@@ -111,24 +86,12 @@ def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_ma
     pxl_0 = f'{upia_s}_0'
     pxl_n = f'{last_pixel_type}_{nbhd_radius}'
     center_pxl = f'nbhd_center_upi_int'
-    # surr_pxl = f'nbhd_surr_upi_int'
-
 
     upi_connectivity_short = pd_unique_values(upi_connectivity, col_names=[pxl_0, pxl_n], observed=True)
 
     nbhds_markers = upi_connectivity_short.join(last_to_marker_counts.set_index('upi_int')[['marker', 'Count']], on=pxl_n)[[pxl_0, 'marker', 'Count']].rename(
         columns={pxl_0: center_pxl}).groupby([center_pxl, 'marker'], as_index=False, observed=True)['Count'].sum()
     
-    # nbhds_total_counts = nbhds_markers.groupby(center_pxl, observed=True)['Count'].sum()
-
-    # upi_markers_pivoted = pd.pivot_table(base_upi_to_marker_counts, values='Count', index='upi_int', columns='marker', observed=True, fill_value=0).astype(int)
-
-    # Table showing marker counts per neighborhood (each nbhd is defined by a center pixel; neighborhoods overlap)
-    # nbhds_markers_pivoted = pd.pivot_table(nbhds_markers, values='Count', index=center_pxl, columns='marker', observed=True, fill_value=0,).astype(int)
-
-    # for marker in vars:
-    #     if marker not in nbhds_markers_pivoted.columns:
-    #         nbhds_markers_pivoted[marker] = 0
     return {
         'connectivity': upi_connectivity_short,
         'nbhd_marker_counts': nbhds_markers,
@@ -137,17 +100,26 @@ def get_component_nbhds(component_edgelist, upia_unique, nbhd_radius, upia_to_ma
     
 
 
-def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, components=None, vars=None, compute_pixel_graph=False, verbose=True):
+def get_pixel_nbhd_counts(pg_edgelist, adata, pxl_type_for_counts='both', nbhd_radius=0, components=None, vars=None, compute_pixel_graph=False, verbose=True):
+    '''
+    Calculates the neighborhood pixel graph of the given bipartite graph, and returns the counts of markers per pixel and per neighborhood, and also
+    returns the pixel graph itself if compute_pixel_graph=True.
+    pg_edgelist: pg_data.edgelist for some pg_data
+    adata: pg_data.adata for some pg_data
+    pxl_type_for_counts: Pixel type ('a', 'b', or 'both') for which to return the marker counts per pixel. Note that
+                        regardless, the neighborhood graph in this implementation will always be computed around A pixels.
+    nbhd_radius: the distance of pixels in edges from a given base pixel for which those pixels are considered in that base pixel's neighborhood.
+    I.e., nbhd_radius=0 means no neighborhood graph is computed. nbhd_radius=1, pixel_type='a' means each neighborhood
+    is an A pixel and all its adjacent B pixels, and nbhd_radius=2 means an A pixel and all its adjacent A pixels
+    (those connected through a B pixel).
+    '''
     if components is None:
         components = adata.obs_names
     if vars is None:
         vars = adata.var_names    
     # counts_df = adata.to_df(count_layer)
 
-    assert pixel_type in ('a', 'b', 'both')
-
-    if nbhd_radius > 0:
-        assert pixel_type == 'a'           
+    assert pxl_type_for_counts in ('a', 'b', 'both')   
 
     if verbose:
         print_w_time('Starting conversion...')
@@ -171,17 +143,17 @@ def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, 
 
         component_edgelist = component_edgelist_orig.join(upia_unique['upia_int'], on='upia').join(upib_unique['upib_int'], on='upib')
 
-        if pixel_type in ('a', 'both') or nbhd_radius > 0:
+        if pxl_type_for_counts in ('a', 'both') or nbhd_radius > 0:
             upia_to_marker_counts = component_edgelist.groupby(['upia_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upia_int': 'upi_int'})
             upia_to_marker_counts['type'] = 'a'
         
-        if pixel_type in ('b', 'both') or nbhd_radius > 0:
+        if pxl_type_for_counts in ('b', 'both') or nbhd_radius > 0:
             upib_to_marker_counts = component_edgelist.groupby(['upib_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upib_int': 'upi_int'})
             upib_to_marker_counts['type'] = 'b'
         
-        if pixel_type == 'a':
+        if pxl_type_for_counts == 'a':
             upi_to_marker_counts = upia_to_marker_counts
-        elif pixel_type == 'b':
+        elif pxl_type_for_counts == 'b':
             upi_to_marker_counts = upib_to_marker_counts
         else:
             upi_to_marker_counts = pd.concat((upia_to_marker_counts, upib_to_marker_counts), axis=0)
@@ -209,9 +181,6 @@ def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, 
             graph = Graph(edges_sparse, )
             graph_per_component.append(graph)
 
-
-
-    
     return {
         'pixel_counts': pd.concat(pixel_counts_per_component, axis=0, ignore_index=True),
         'nbhd_counts': pd.concat(nbhd_counts_per_component, axis=0, ignore_index=True) if nbhd_radius > 0 else None,
@@ -219,511 +188,32 @@ def get_pixel_nbhd_counts(pg_edgelist, adata, pixel_type='both', nbhd_radius=0, 
     }
 
 
-    
-    # marker_pair_tuples = get_marker_pair_tuples(vars, only_diff=True, only_sorted_pairs=True)
-    # marker_pair_strs = get_marker_pair_names(vars, only_diff=True, only_sorted_pairs=True) 
-
-
-def convert_edgelist_to_protein_pair_colocalization(pg_edgelist, adata, nbhd_radius=1, pxl_type='a', components=None, verbose='tqdm', 
-                                                    detailed_info=False, count_layer='counts',
-                                                    score_types=['autocorr', 'coloc']):
+def pairs_to_marginals_correlation(counts, coloc, marker_names):
     '''
-    Converts the edgelist from pg_data.edgelist into a table that describes colocalization of pairs of proteins in small neighborhoods in the graph.
-    components (optional): subset of components on which to calculate
-    pg_edgelist: edgelist containing at least all of the components detailed in "components"
-    verbose: 'tqdm' or True for a progress bar, an integer v for a checkpoint every v components, False for nothing
-    Returns pandas DataFrame with index and columns (marker_1, marker_2) for each pair.
-    count_layer: the layer from pg_data.adata from which to take raw marker counts for frequency estimation.
-    The values are calculated conceptually as follows for every component:
-    close_pixel_pairs = set of pairs of pixels with distance <= nbhd_size from each other
-    for every two markers m1, m2:
-    score[(m1, m2)] = \sum_{pair \in close_pixel_pairs} 1{m1 in pixel1 and m2 in pixel2}
-    '''
+    Calculates (multiple) correlation between marginal counts of markers, and coloc scores.
 
-    assert pxl_type in ('a', 'b')
+    counts: dataframe of (n_cells, n_features)
+    coloc: dataframe of (n_cells, n_coloc_features)
 
-    if components is None:
-        components = adata.obs_names
+    Coloc features should be pairs (in the format generated by pair2str)
+    The two dataframes should share an index (the cell names).
 
-    # marker_pair_coloc_by_component_list = []
-    marker_pair_intrsct_list = []
-    marker_pair_union_list = []
-
-    assert all([t in ('autocorr', 'coloc') for t in score_types])
-
-    layers = {'actual': int, 'expected': float, 'variance': float, 'z': float, 'normalization': int}
-
-    results = {score_type: {layer: [] for layer in layers.keys()} for score_type in score_types}
-
-    if detailed_info:
-        detailed_info_dict = {
-            'upi_connectivity': [],
-            'nbhd_marker_counts': [],
-            'upia_marker_counts': [],
-            'upib_marker_counts': [],
-            'upia_to_upia_int': [],
-        }
-
-    marker_names = adata.var_names
-    marker_pair_tuples = get_marker_pair_tuples(marker_names, only_diff=True, ordered_pairs=False) 
-
-    counts_df = adata.to_df(count_layer)
-
-    if verbose is not False:
-        print_w_time('Starting conversion...')
-
-    iter = tqdm(components) if verbose in (True, 'tqdm') else components
-    for i_comp, component in enumerate(iter):
-        # component_edgelist_orig = pg_data.edgelist_lazy.filter(pl.col('component') == component).select(['upia', 'upib', 'marker']).collect().to_pandas()
-        component_edgelist_orig = pg_edgelist[pg_edgelist['component'] == component]
-
-        component_counts = counts_df.loc[component]
-        N = component_counts.sum()
-        freqs = component_counts / component_counts.sum()
-
-        upi_s = 'upia_int' if pxl_type == 'a' else 'upib_int'
-        upi_s_other = 'upib_int' if pxl_type == 'a' else 'upia_int'
-
-        n_upia_unique = component_edgelist_orig['upia'].nunique()
-        n_upib_unique = component_edgelist_orig['upib'].nunique()
-
-        upia_unique = pd.DataFrame({'upi': component_edgelist_orig['upia'].unique(), 'upi_type': 'a', 'upia_int': range(0, n_upia_unique)}).set_index('upi')
-        upib_unique = pd.DataFrame({'upi': component_edgelist_orig['upib'].unique(), 'upi_type': 'b', 'upib_int': range(n_upia_unique, n_upia_unique + n_upib_unique)}).set_index('upi')
-
-        # upi_unique = pd.concat((upia_unique, upib_unique), axis=0)
-
-        # upia_unique = pd.DataFrame(component_edgelist_orig['upia'].unique()).reset_index().rename(columns={0:'upia'}).set_index('upia').rename(columns={'index':'upia_int'})
-        # upib_unique = pd.DataFrame(component_edgelist_orig['upib'].unique()).reset_index().rename(columns={0:'upib'}).set_index('upib').rename(columns={'index': 'upib_int'})
-
-        component_edgelist = component_edgelist_orig.join(upia_unique['upia_int'], on='upia').join(upib_unique['upib_int'], on='upib')
-        upia_upib_int_unique = pd_unique_values(component_edgelist, ['upia_int', 'upib_int'], observed=True)
-
-        upia_to_marker_counts = component_edgelist.groupby(['upia_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upia_int': 'upi_int'})
-        upia_to_marker_counts['type'] = 'a'
-        upib_to_marker_counts = component_edgelist.groupby(['upib_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upib_int': 'upi_int'})
-        upib_to_marker_counts['type'] = 'b'
-
-        base_upi_to_marker_counts = upia_to_marker_counts if pxl_type == 'a' else upib_to_marker_counts
-        other_upi_to_marker_counts = upib_to_marker_counts if pxl_type == 'a' else upia_to_marker_counts
-
-        # if group_markers:
-        #     upi_to_grouped_marker_counts = upi_to_ungrouped_marker_counts.copy()
-        #     upi_to_grouped_marker_counts['Count'] = 1
-
-        upi_connectivity = upia_unique if pxl_type =='a' else upib_unique
-        upi_connectivity = upi_connectivity.reset_index()[[upi_s]].rename(columns={upi_s: f'{upi_s}_0'})
-
-        for i in range(nbhd_radius):
-            if i % 2 == 0:
-                upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upi_s)[upi_s_other], on=f'{upi_s}_{i}').rename(columns={upi_s_other: f'{upi_s_other}_{i+1}'})
-            else:
-                upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upi_s_other)[upi_s], on=f'{upi_s_other}_{i}').rename(columns={upi_s:f'{upi_s}_{i+1}'})
-
-            upi_connectivity = pd_unique_values(upi_connectivity, col_names=upi_connectivity.columns.values, observed=True)
-
-        last_is_other = nbhd_radius % 2 != 0
-        last_pixel_type = upi_s_other if last_is_other else upi_s
-        last_pixel_type_marker_counts = other_upi_to_marker_counts if last_is_other else base_upi_to_marker_counts
-
-        pxl_0 = f'{upi_s}_0'
-        pxl_n = f'{last_pixel_type}_{nbhd_radius}'
-        center_pxl = f'nbhd_center_upi_int'
-
-        # center_marker = 'marker_1'
-        # nbhd_marker = 'marker_2'
-
-        # center_count = 'Count_1'
-        # nbhd_count = 'Count_2'            
-
-        # print(upi_connectivity)
-        upi_connectivity_short = pd_unique_values(upi_connectivity, col_names=[pxl_0, pxl_n], observed=True)
-
-        # Count each pair of pixels only once
-        # upi_connectivity = upi_connectivity[upi_connectivity[center_pxl] <= upi_connectivity[nbhd_pxl]]
-
-        upi_total_counts = base_upi_to_marker_counts.groupby('upi_int', observed=True)['Count'].sum()
-
-        nbhds_markers = upi_connectivity_short.join(last_pixel_type_marker_counts.set_index('upi_int')[['marker', 'Count']], on=pxl_n)[[pxl_0, 'marker', 'Count']].rename(
-            columns={pxl_0: center_pxl}).groupby([center_pxl, 'marker'], as_index=False, observed=True)['Count'].sum()
-        nbhds_total_counts = nbhds_markers.groupby(center_pxl, observed=True)['Count'].sum()
-
-        # nbhds_markers = nbhds_markers.groupby([center_pxl, 'marker'], observed=True)['Count'].sum().reset_index().rename(columns={0: 'Count'})
-        # if group_markers:
-        #     nbhds_markers['Count'] = 1
-        # nbhds_markers['Count'] = nbhds_markers['Count'].astype(int)
-
-        # Table showing marker counts per pixel
-
-        upi_markers_pivoted = pd.pivot_table(base_upi_to_marker_counts, values='Count', index='upi_int', columns='marker', observed=True, fill_value=0).astype(int)
-
-        # Table showing marker counts per neighborhood (each nbhd is defined by a center pixel; neighborhoods overlap)
-        nbhds_markers_pivoted = pd.pivot_table(nbhds_markers, values='Count', index=center_pxl, columns='marker', observed=True, fill_value=0,).astype(int)
-
-        for marker in marker_names:
-            for tbl in (upi_markers_pivoted, nbhds_markers_pivoted):
-                if marker not in tbl.columns:
-                    tbl[marker] = 0
-        
-
-
-        def f(p):
-            return p*(1-p)
-        
-        def g(p, n):
-            return np.power(1-p, n)
-        
-        if results.get('autocorr'):
-
-            autocorr = pd.Series(
-                [((upi_total_counts)*(nbhds_markers_pivoted[m] > 0).astype(int)).sum(axis=0) for m in marker_names],
-                index=marker_names
-            )
-
-            expected_autocorr = pd.Series(
-                [N - ((upi_total_counts)*g(freqs[m], nbhds_total_counts)).sum(axis=0) for m in marker_names],
-                index=marker_names
-            )
-
-            variance_autocorr = pd.Series(
-                [(np.square(upi_total_counts)*f(g(freqs[m], nbhds_total_counts))).sum(axis=0) for m in marker_names],
-                index=marker_names
-            )
-
-            results['autocorr']['actual'].append(autocorr)
-            results['autocorr']['expected'].append(expected_autocorr)
-            results['autocorr']['variance'].append(variance_autocorr)
-            results['autocorr']['z'].append(((autocorr - expected_autocorr) / np.sqrt(variance_autocorr)).replace([np.inf, -np.inf, np.nan], 0))
-
-
-        def h(p1, p2, n):
-            return np.power(1-p1, n) + np.power(1-p2, n) - np.power(1-p1-p2, n)
-        
-        if results.get('coloc'):
-
-
-            coloc = pd.Series(
-                [((upi_total_counts)*((nbhds_markers_pivoted[m1] > 0).astype(int) & (nbhds_markers_pivoted[m2] > 0).astype(int))).sum(axis=0) for m1, m2 in marker_pair_tuples],
-                index=marker_pair_tuples,
-            )
-
-            normalization_coloc = pd.Series(
-                [((upi_total_counts)*((nbhds_markers_pivoted[m1] > 0).astype(int) | (nbhds_markers_pivoted[m2] > 0).astype(int))).sum(axis=0) for m1, m2 in marker_pair_tuples],
-                index=marker_pair_tuples,
-            )
-
-            expected_coloc = pd.Series(
-                [N - ((upi_total_counts)*(h(freqs[m1], freqs[m2], nbhds_total_counts))).sum(axis=0) for m1, m2 in marker_pair_tuples],
-                index=marker_pair_tuples,
-            )
-
-            variance_coloc = pd.Series(
-                [(np.square(upi_total_counts)*(f(h(freqs[m1], freqs[m2], nbhds_total_counts)))).sum(axis=0) for m1, m2 in marker_pair_tuples],
-                index=marker_pair_tuples,
-            )
-
-
-            results['coloc']['actual'].append(coloc)
-            results['coloc']['expected'].append(expected_coloc)
-            results['coloc']['normalization'].append(normalization_coloc)
-            results['coloc']['variance'].append(variance_coloc)
-            results['coloc']['z'].append(((coloc - expected_coloc) / np.sqrt(variance_coloc)).replace([np.inf, -np.inf, np.nan], 0))
-
-
-        # nbhds_m2_binary = []
-        # upi_m1 = []
-        # upi_total_times_binary = []
-        # m1_freqs = []
-        # m2_freqs = []
-        # m1_total = []
-        # prob_no_m2_in_nbhds = []
-
-        # pixel_sum_proportion = {}
-
-
-        # for m1, m2 in marker_pair_tuples:
-        #     if m1 != m2:
-        #         cur_m2_binary = (nbhds_markers_pivoted[m2] > 0).astype(int)
-        #     else:
-        #         cur_m2_binary = (nbhds_markers_pivoted[m2] > 1).astype(int)
-        #     nbhds_m2_binary.append(cur_m2_binary)
-        #     upi_m1.append(upi_markers_pivoted[m1])
-        #     upi_total_times_binary.append(upi_total_counts*cur_m2_binary)
-        #     # prob_no_m2_in_nbhds.append(np.power(1 - component_freqs[m2], nbhds_total_counts))
-
-        #     m1_freqs.append(component_freqs[m1])
-        #     m1_total.append(component_counts[m1])
-        #     m2_freqs.append(component_freqs[m2])
-
-
-
-        # # nbhds_m2_binary, upi_m1, upi_total_times_binary, prob_no_m2_in_nbhds  = [pd.DataFrame(l, index=marker_pair_tuples).T for l in  
-        # #         (nbhds_m2_binary, upi_m1, upi_total_times_binary, prob_no_m2_in_nbhds)]
-        
-        # nbhds_m2_binary, upi_m1, upi_total_times_binary = [pd.DataFrame(l, index=marker_pair_tuples).T for l in  
-        #         (nbhds_m2_binary, upi_m1, upi_total_times_binary)]
-        
-        # m1_freqs, m2_freqs, m1_total = [pd.Series(l, index=marker_pair_tuples) for l in (m1_freqs, m2_freqs, m1_total)]
-                
-        # coloc = pd.Series((upi_m1*nbhds_m2_binary).sum(axis=0), index=marker_pair_tuples)
-        # expected_coloc = pd.Series(m1_freqs*(upi_total_times_binary).sum(axis=0), index=marker_pair_tuples)
-        # variance_coloc = pd.Series((m1_freqs)*(1-m1_freqs)*(upi_total_times_binary).sum(axis=0), index=marker_pair_tuples)
-        # # experimental_exp = pd.Series(
-        # #     m1_total - (m1_freqs / (1 - m2_freqs))*(prob_no_m2_in_nbhds.mul(upi_total_counts, axis=0)).sum(axis=0),
-        # #     index=marker_pair_tuples
-        # # )
-        # # experimental_variance = pd.Series(
-        # #     (m1_freqs / (1 - m2_freqs)).pow(2) * (prob_no_m2_in_nbhds*(1 - prob_no_m2_in_nbhds).mul(upi_total_counts.pow(2), axis=0)).sum(axis=0) + \
-        # #     + m1_freqs*(1 - m1_freqs - m2_freqs) / (1 - m2_freqs).pow(2) * (prob_no_m2_in_nbhds.mul(upi_total_counts, axis=0)).sum(axis=0),
-        # #     index=marker_pair_tuples,
-        # # )
-
-                # coloc_list.append(coloc)
-        # expected_coloc_list.append(expected_coloc)
-        # variance_coloc_list.append(variance_coloc)
-
-
-        '''
-        # For markers m1 and m2, the contribution of every pixel k to coloc(m1,m2) is the count of m1 in k, if the neighborhood of k includes at least one marker m2
-        coloc = pd.Series(
-            [
-                (upi_markers_pivoted[m1]*(nbhds_markers_pivoted[m2].astype(bool).astype(int))).sum() for m1, m2 in marker_pair_tuples
-            ], index=marker_pair_tuples
-        )
-
-
-        # Expected value of coloc(m1,m2) under null hypothesis is the cell-wide frequency of m1 times the sum of molecules in the vicinity of m2 molecules
-        expected_coloc = pd.Series(
-            [
-                component_freqs[m1]*(
-                    upi_total_counts*(nbhds_markers_pivoted[m2].astype(bool).astype(int))
-                ).sum() for m1, m2 in marker_pair_tuples
-            ], index=marker_pair_tuples
-        )
-
-        # Variance is same but with another factor (1-freq(m1))
-        variance_coloc = pd.Series(
-            [
-                (1-component_freqs[m1])*component_freqs[m1]*(
-                    upi_total_counts*(nbhds_markers_pivoted[m2].astype(bool).astype(int))
-                ).sum() for m1, m2 in marker_pair_tuples
-            ], index=marker_pair_tuples
-        )
-        '''
-
-        
-        # marker_pair_coloc = pd.Series(
-        #     [
-        #         (nbhds_markers_pivoted[pair[0]]*(nbhds_markers_pivoted[pair[1]].astype(bool).astype(int))).sum() for pair in marker_diff_pair_names
-        #     ], index=marker_diff_pair_names,
-        # )
-
-        # experimental_exp_list.append(experimental_exp)
-        # experimental_variance_list.append(experimental_variance)
-
-        if detailed_info:
-            for (df, name) in zip((nbhds_markers, upia_unique, upia_to_marker_counts, upib_to_marker_counts, upi_connectivity), 
-                                  ('nbhd_marker_counts', 'upia_to_upia_int', 'upia_marker_counts', 'upib_marker_counts', 'upi_connectivity')):
-                df['component'] = component
-                detailed_info_dict[name].append(df)
-
-        # if group_markers:
-        #     nbhds_markers_pivoted = nbhds_markers_pivoted.astype(bool).astype(int)
-
-
-
-        # print(nbhds_markers_pivoted)
-
-        # marker_pairs_intersection = pd.Series(
-        #     [(nbhds_markers_pivoted[sorted_marker_pair[0]] & nbhds_markers_pivoted[sorted_marker_pair[1]]).sum() for sorted_marker_pair in sorted_marker_pair_names],
-        #     index=sorted_marker_pair_names
-        # )
-        # marker_pairs_union = pd.Series(
-        #     [(nbhds_markers_pivoted[sorted_marker_pair[0]] | nbhds_markers_pivoted[sorted_marker_pair[1]]).sum() for sorted_marker_pair in sorted_marker_pair_names],
-        #     index=sorted_marker_pair_names,
-        # )
-
-        # marker_pair_intrsct_list.append(marker_pairs_intersection)
-        # marker_pair_union_list.append(marker_pairs_union)
-
-        # print(marker_pairs_intersection)
-        # print(marker_pairs_union)
-
-        # marker_pairs_pixel_pairs = upi_connectivity.join(upi_to_marker_counts.set_index(upi_s)[['marker', 'Count']], on=center_pxl).rename(columns={'marker': center_marker, 'Count': center_count}).join(
-        #                     upi_to_marker_counts.set_index(upi_s)[['marker', 'Count']], on=nbhd_pxl
-        #                 ).rename(columns={'marker': nbhd_marker, 'Count': nbhd_count})
-        
-        # # Remove same-marker pairs
-        # marker_pairs_pixel_pairs = marker_pairs_pixel_pairs[marker_pairs_pixel_pairs[center_marker] != marker_pairs_pixel_pairs[nbhd_marker]]
-
-        # marker_pairs_pixel_pairs['marker_pair'] = [marker_pairs_to_sorted_pairs[(marker_1, marker_2)] for marker_1, marker_2 in zip(marker_pairs_pixel_pairs[center_marker], marker_pairs_pixel_pairs[nbhd_marker])]
-
-        # marker_pairs_pixel_pairs['Product'] = marker_pairs_pixel_pairs[center_count]*marker_pairs_pixel_pairs[nbhd_count]
-
-        # marker_pair_counts = marker_pairs_pixel_pairs.groupby('marker_pair')['Product'].sum().rename('Count')
-
-        # marker_pair_coloc_by_component_list.append(marker_pair_counts.astype(int))
-
-        if type(verbose) == int:
-            if i_comp % verbose == 0:
-                print_w_time(f'Component {i_comp} finished')
-
-    if verbose is not False:
-        print_w_time('Finished conversion!')
-
-    # marker_pair_coloc_by_component = pd.DataFrame(data=marker_pair_coloc_by_component_list, index=components).fillna(0).astype(int)
-    # col_names = sorted(list(marker_pair_coloc_by_component.columns))
-    # marker_pair_coloc_by_component = marker_pair_coloc_by_component[col_names]
-    
-    # marker_pair_intrsct_df = pd.DataFrame(marker_pair_intrsct_list, index=components, dtype=int)
-    # marker_pair_union_df = pd.DataFrame(marker_pair_union_list, index=components, dtype=int)
-
-    # marker_pair_names_tuples = list(marker_pair_intrsct_df.columns.values)
-
-    for score_type in score_types:
-        for layer, dtype in layers.items():
-            results[score_type][layer] = pd.DataFrame(results[score_type][layer], index=components, dtype=dtype)
-
-
-    # coloc_layers = {}
-
-    # # for res_name, res_list, res_dtype in zip(('coloc', 'expected_coloc', 'variance_coloc', 'experimental_exp', 'experimental_variance'), 
-    # #                                          (coloc_list, expected_coloc_list, variance_coloc_list, experimental_exp_list, experimental_variance_list), 
-    # #                                          (int, float, float, float, float)):
-    # for res_name, res_list, res_dtype in zip(('coloc', 'expected_coloc', 'variance_coloc'), 
-    #                                         (coloc_list, expected_coloc_list, variance_coloc_list), 
-    #                                         (int, float, float)):
-    #     coloc_layers[res_name] = pd.DataFrame(res_list, index=components, dtype=res_dtype)
-    
-    # coloc_layers['z_coloc'] = (coloc_layers['coloc'] - coloc_layers['expected_coloc']) / (coloc_layers['variance_coloc']).map(np.sqrt)
-    # coloc_layers['z_coloc'].replace([np.inf, -np.inf, np.nan], 0, inplace=True)
-
-    # autocorr_layers = {}
-    # for res_name, res_list, res_dtype in zip(('autocorr', 'expected_autocorr', 'variance_autocorr'), 
-    #                                     (autocorr_list, expected_autocorr_list, variance_autocorr_list), 
-    #                                     (int, float, float)):
-    #     autocorr_layers[res_name] = pd.DataFrame(res_list, index=components, dtype=res_dtype)
-    
-    # autocorr_layers['z_coloc'] = (coloc_layers['coloc'] - coloc_layers['expected_coloc']) / (coloc_layers['variance_coloc']).map(np.sqrt)
-    # autocorr_layers['z_coloc'].replace([np.inf, -np.inf, np.nan], 0, inplace=True)
-
-    # layers['experimental_z_coloc'] = (layers['coloc'] - layers['experimental_exp']) / (layers['experimental_variance']).map(np.sqrt)
-    # layers['experimental_z_coloc'].replace([np.inf, -np.inf], 0, inplace=True)
-
-    if results.get('coloc'):
-        for df in results['coloc'].values():
-            # Rename columns to strings instead of tuples
-            df.rename(
-                columns={(m1, m2): pair2str(m1,m2) for m1,m2 in df.columns.values},
-                inplace=True
-            )
-    
-    ret = dotdict({
-        'results': results,
-        'info': dict(nbhd_radius=nbhd_radius, pxl_type=pxl_type, marker_pair_tuples=marker_pair_tuples)
-    })
-
-    # return_dict = {
-    #     'marker_pair_intersection': marker_pair_intrsct_df,
-    #     'marker_pair_union': marker_pair_union_df,
-    #     'marker_pair_names_tuples': marker_pair_names_tuples,
-    # }
-
-    if detailed_info:
-        for k, v in detailed_info_dict.items():
-            ret.info[k] = pd.concat(v, axis=0)
-    
-    return ret
-
-
-def apply_func_to_neighbors(adata, neighbors_key, func):
-    '''
-    Receives adata with a obsp connectivities sparse matrix.
-    Applies func between each pair of neighbors, and returns a matrix M with the same structure but M_ij = func(obs_i, obs_j) for neighboring observations.
-    Func receives two observation indices and returns a scalar.
-    '''
-    neighbors_row, neighbors_col = adata.obsp[f'{neighbors_key}_distances'].nonzero()
-    func_data = []
-    for (obs1, obs2) in tqdm(zip(neighbors_row, neighbors_col)):
-        func_data.append(func(obs1, obs2))
-    return csr_matrix(func_data, (neighbors_row, neighbors_col))
-         
-
-def get_rep(adata, rep_name):
-    '''
-    Retrieves a representation from adata, checking first in layers and then in obsm.
-    If rep_name is None returns main layer.
-    '''
-    if rep_name is None:
-        rep = adata.to_df()
-    elif rep_name in adata.layers:
-        rep = adata.to_df(rep_name)
-    elif rep_name in adata.obsm:
-        rep = adata.obsm[rep_name]
-    else:
-        raise RuntimeError(f'{rep_name} not in layers or obsm')
-    return rep
-
-
-def multiple_correlation(df, vars, target):
-    '''
-    Calculates the R^2 score of https://en.wikipedia.org/wiki/Coefficient_of_multiple_correlation
-    df: Dataframe containing source and target variables
-    vars: list of source variables
-    target: name of target variable
-    '''
-    corrs = df[vars + [target]].corr()
-    R_xx = corrs.loc[vars, vars].to_numpy()
-    c = corrs.loc[vars, target].to_numpy().reshape((2,1))
-    return (c.T @ np.linalg.solve(R_xx, c)).item()
-
-
-def pairs_to_marginals_correlation(counts_and_coloc_df, marker_names):
-    '''
     Based on the R^2 score of https://en.wikipedia.org/wiki/Coefficient_of_multiple_correlation
     Ranks the pairs by the extent to which they are a linear function of the two marginal counts.
-
-    expects df of (n_cells, n_features) where features includes both count and coloc. 
-    The values should be in raw count space
     '''
-    pair_names = get_marker_pair_names(marker_names)
-    means = counts_and_coloc_df.mean(axis=0)
+    counts_features = counts.columns
+    coloc_features = coloc.columns
+    counts_and_coloc = pd.concat(counts, coloc, axis=1)
+    means = counts_and_coloc.mean(axis=0)
     coeff = []
     m1_means = []
     m2_means = []
-    for pair_str in pair_names:
+    for pair_str in coloc_features:
         m1, m2 = str2pair(pair_str)
-        coeff.append(multiple_correlation(counts_and_coloc_df, vars=[m1, m2], target=pair_str))
+        coeff.append(multiple_correlation(counts_and_coloc, vars=[m1, m2], target=pair_str))
         m1_means.append(means[m1])
         m2_means.append(means[m2])
-    return pd.DataFrame({'R2': coeff, 'm1_mean_counts': m1_means, 'm2_mean_counts': m2_means}, index=pair_names)
-        
-
-def fill_with_mean(arr):
-    '''
-    Fills NaN and inf values with mean of columns
-    arr: df or np array
-    Returns copy of arr
-    '''
-    arr = arr.copy()
-    if type(arr) == np.ndarray:
-        nan_inds = np.where(np.isnan(arr) | np.isinf(arr))
-        arr[nan_inds] = np.take(np.nanmean(arr, axis=0), nan_inds[1])
-    elif type(arr) == pd.DataFrame:
-        arr.replace([np.inf, -np.inf], [np.nan, np.nan], inplace=True)
-        arr.replace(np.nan, arr.mean(axis=0), inplace=True)
-    return arr
-
-    
-def plot_cumulative_variance(adata, pca_info_key='pca', ax=None, n_pcs=None, title=None):
-    if ax is None:
-        fig, ax = plt.subplots(1)
-    var_ratio_accum = np.cumsum(adata.uns[pca_info_key]['variance_ratio'])
-    if n_pcs is None:
-        n_pcs = len(var_ratio_accum)
-    sns.scatterplot(x=list(range(1, n_pcs + 1)), y=var_ratio_accum, ax=ax)
-    title = title if title is not None else 'Cumulative Variance Explained'
-    ax.set_title(title)
-    return ax
+    return pd.DataFrame({'R2': coeff, 'm1_mean_counts': m1_means, 'm2_mean_counts': m2_means}, index=coloc_features)
 
 
 def compute_graph_layout(pg_data, component):
@@ -732,7 +222,9 @@ def compute_graph_layout(pg_data, component):
 
 def plot_cell_with_markers(graph_layout_data, marker_1, marker_2=None, norm=True, **marker_kwargs):
     '''
-    marker_1 will be drawn as red, marker_2 as blue
+    Visualize a cell with markers highighted on it
+    marker_1 will be drawn as red, marker_2 (optional) as blue
+    norm: If true, normalize the graph layout coordinates, to plot the cell as a sphere.
     '''
 
     pio.renderers.default = "plotly_mimetype+notebook_connected"
@@ -797,6 +289,11 @@ def plot_cell_with_markers(graph_layout_data, marker_1, marker_2=None, norm=True
 
 
 def plot_cell_smooth(graph_layout_data, marker_1, marker_2=None):
+    '''
+    Visualize a cell with markers highighted on it as a smooth continuum (not as single dots)
+    marker_1 will be drawn as red, marker_2 (optional) as blue
+    norm: If true, normalize the graph layout coordinates, to plot the cell as a sphere.
+    '''
 
     # --- Create a spherical grid ---
     n_theta = 100  # number of points along polar angle (theta)
@@ -887,9 +384,6 @@ def plot_cell_smooth(graph_layout_data, marker_1, marker_2=None):
 
     return fig
 
-def center_feature_matrix(arr):
-    return (arr - arr.mean(axis=0)) / (arr.std(axis=0))
-
 
 def convert_polarization_to_feature_matrix(polarization, components, vars=None, key='morans_i', var_suffix='pol', fill_na_with_mean=True, rescale=False):
     '''
@@ -935,69 +429,6 @@ def convert_colocalization_to_feature_matrix(coloc, components, vars=None, pairs
     result = result.reindex(components)
     return result
 
-def get_pxl_dataset(base_url, base_dataset_dir, filenames, aggregation_sample_names):
-    for filename in filenames:
-        os.system(f'curl -L -O -C - --create-dirs --output-dir {base_dataset_dir} {base_url}/{filename}')
-
-    datasets = [pixelator.read(base_dataset_dir / filename) for filename in filenames]
-    pg_data = pixelator.simple_aggregate(
-        aggregation_sample_names, datasets
-    )
-    return pg_data
-
-
-def plot_histograms(adata=None, keys=None, dfs=None, names=None, vars=None, hue=None, n_cols=8, kind='kde'):
-    '''
-    Pass either adata with obsm keys, or list of dfs with same columns
-    If passing hue, hue must be an entry in adata.obs, and keys must be of length 1
-    Returns flattened axes
-    keys: obsm keys
-    kind: kde/hist
-
-    '''
-    assert dfs or all((adata, keys))
-    assert not hue or len(keys) == 1
-    if adata:
-        dfs = [adata.obsm[key] for key in keys]
-    if vars is None:
-        vars = dfs[0].columns
-    if names is None:
-        if keys:
-            names = keys
-        else:
-            names = [f'{i}' for i in range(len(dfs))]
-    n_plots = len(vars)
-    n_rows = (n_plots + n_cols - 1) // n_cols 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 3*n_rows))
-    axes = axes.flatten()
-    if hue:
-        dfs[0] = dfs[0].copy()
-        dfs[0][hue] = adata.obs[hue]
-    for ax, var in zip(axes, vars):
-        plot_f = {'kde': sns.kdeplot, 'hist': sns.histplot}[kind]
-        kwargs = {'kde': dict(fill=True, alpha=0.5), 'hist': dict(alpha=0.5)}[kind]
-        for i, df in enumerate(dfs):
-            if hue:
-                plot_f(df, x=var, ax=ax, hue=hue, legend=(ax==axes[0]), **kwargs)
-            else:
-                plot_f(df, x=var, ax=ax, color=sns.color_palette()[i], label=names[i], **kwargs)
-        if ax == axes[0] and not hue:
-            ax.legend(loc='lower left', bbox_to_anchor=(0, 1.05))
-        # ax.set_title(var)
-    
-    fig.tight_layout()
-    return axes
-
-def arr_to_df(arr, df):
-    return pd.DataFrame(arr, index=df.index, columns=df.columns)
-
-
-def plot_mean_std(df, axis=0, ax=None, **kwargs):
-    ax = sns.scatterplot(x=df.mean(axis=axis), y=df.std(axis=axis), ax=ax, **kwargs)
-    ax.set_xlabel('Mean')
-    ax.set_ylabel('Std')
-    return ax
-
 
 def get_model_latents(adata, model, modalities_latent_names):
     for modality, latent_name in modalities_latent_names:
@@ -1017,13 +448,6 @@ def train_model(adata, model_cls, setup_kwargs, model_kwargs, train_kwargs, moda
     return model
 
 
-def _log(s, logger):
-    if logger:
-        logger.info(s)
-    else:
-        print(s)
-
-
 def compute_hotspot_pol_and_coloc(edgelist, adata, components, vars=None, marker_count_threshold=10, knn_neighbors=30, njobs=8, logger=None):
     '''
     Computes polarization and coloc based on Hotspot.
@@ -1037,7 +461,7 @@ def compute_hotspot_pol_and_coloc(edgelist, adata, components, vars=None, marker
     
     results = []
 
-    _log('Beginning conversion...', logger)
+    log('Beginning conversion...', logger)
 
     with ProcessPoolExecutor(max_workers=njobs) as executor:
         futures = [
@@ -1051,7 +475,7 @@ def compute_hotspot_pol_and_coloc(edgelist, adata, components, vars=None, marker
             ) for i, component in enumerate(components)
         ]
         results = [future.result() for future in futures]
-        _log('Finished conversion!', logger)
+        log('Finished conversion!', logger)
 
     all_pol, all_coloc = zip(*results)
         
@@ -1060,30 +484,9 @@ def compute_hotspot_pol_and_coloc(edgelist, adata, components, vars=None, marker
 
     return pol, coloc
 
-    # all_pol = []
-    # all_coloc = []
-    # for component in tqdm(components):
-    #     try:
-    #         with io.capture_output() as captured:
-    #             comp_pol, comp_coloc = compute_hotspot_pol_and_coloc_single_component(
-    #                 edgelist=edgelist,
-    #                 adata=adata,
-    #                 component=component, 
-    #                 vars=vars,
-    #                 marker_count_threshold=marker_count_threshold, 
-    #                 knn_neighbors=knn_neighbors,
-    #             )
-    #     except Exception as e:
-    #         print(f'ERROR IN COMPONENT {component}:\n{e}')
-    #         break
-    #     all_pol.append(comp_pol)
-    #     all_coloc.append(comp_coloc)
-    # pol = pd.concat(all_pol, axis=0, ignore_index=True)
-    # coloc = pd.concat(all_coloc, axis=0, ignore_index=True)
-    # return pol, coloc
 
 def _process_component(component, idx, logger, **kwargs):
-    _log(f'Calc {idx}', logger)
+    log(f'Calc {idx}', logger)
     try:
         with io.capture_output() as captured:
             pol, coloc = compute_hotspot_pol_and_coloc_single_component(
@@ -1092,28 +495,18 @@ def _process_component(component, idx, logger, **kwargs):
             )
             return pol, coloc
     except Exception as e:
-        _log(f'ERROR IN COMPONENT {component}:\n{e}', logger)
+        log(f'ERROR IN COMPONENT {component}:\n{e}', logger)
         return pd.DataFrame(), pd.DataFrame()
 
 def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, vars=None, marker_count_threshold=10, knn_neighbors=30):
     
     # For graph computation pass all vars, to not disconnect the graph
-    results = get_pixel_nbhd_counts(edgelist, adata, pixel_type='a', nbhd_radius=2, 
+    results = get_pixel_nbhd_counts(edgelist, adata, pxl_type_for_counts='a', nbhd_radius=2, 
                                     components=[component], compute_pixel_graph=True, verbose=False, vars=None)
     pixel_counts = results['pixel_counts']
     pixel_counts_pivot = pd.pivot_table(pixel_counts, index='upi_int', columns='marker', values='Count', observed=True, fill_value=0).astype(int)
     g = results['graphs'][0]
     distances = dijkstra(g.A, directed=False, unweighted=True)
-
-    # counts_abundant = pixel_counts_pivot[abundant_markers]
-    # sizes_abundant = counts_abundant.sum(axis=1)
-    # nonempty = sizes_abundant[sizes_abundant != 0].index
-    # counts_abundant = counts_abundant.loc[nonempty]
-    # distances_abundant = distances[np.ix_(nonempty, nonempty)]
-
-    # pixel_adata = anndata.AnnData(counts_abundant)
-    # pixel_adata.obsp['dijkstra'] = distances_abundant
-    # pixel_adata.obs['total_counts'] = pixel_adata.to_df().sum(axis=1)
 
     pixel_adata = anndata.AnnData(pixel_counts_pivot)
     pixel_adata.obsp['dijkstra'] = distances
@@ -1146,35 +539,6 @@ def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, v
 
     return hs_pol, long_coloc
 
-# coloc_key = 'jaccard'
-# longform_coloc = pg_data.colocalization[['component', 'marker_1', 'marker_2', coloc_key]].join(adata.obs['sample_class'], on='component')
-# longform_coloc['pair'] = [pair2str(m1, m2, sort=True) for m1, m2 in zip(longform_coloc['marker_1'], longform_coloc['marker_2'])]
-# for (sample_class, cur_adata) in zip(('resting', 'stimulated'), (resting_adata, stim_adata)):
-#     coloc = longform_coloc[longform_coloc['sample_class'] == sample_class]
-#     coloc = coloc.pivot(index='component', columns='pair', values=coloc_key)
-#     coloc = coloc.loc[cur_adata.obs.index]
-#     cur_adata.obsm['pixelgen_coloc'] = coloc
-# pol_key = 'morans_i'
-# longform_polarization = pg_data.polarization[['component', 'marker', pol_key]].join(adata.obs['sample_class'], on='component')
-# for (sample_class, cur_adata) in zip(('resting', 'stimulated'), (resting_adata, stim_adata)):
-#     polarization = longform_polarization[longform_polarization['sample_class'] == sample_class]
-#     polarization = polarization.pivot(index='component', columns='marker', values=pol_key)
-#     polarization = polarization.loc[cur_adata.obs.index]
-#     cur_adata.obsm['pixelgen_polarization'] = polarization
-# resting_annotations, stim_annotations = [anndata.read_h5ad(p) for p in ('/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/resting_annotated_with_asymm_coloc.h5ad', '/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/stim_annotated_with_asymm_coloc.h5ad')]
-# for cur_adata, cur_annotations in zip((resting_adata, stim_adata), (resting_annotations, stim_annotations)):
-#     cur_adata.obs['cell_type'] = cur_annotations.obs['cell_type']
-#     cur_adata.obs['low_res_cell_type'] = cur_annotations.obs['low_res_cell_type']
-#     cur_adata.layers['clr_by_abs'] = clr_transformation(cur_adata.to_df(layer='counts'), axis=0)
-#     cur_adata.X = cur_adata.layers['dsb']
-#     sc.pp.pca(cur_adata, n_comps=50)
-#     sc.pp.neighbors(cur_adata, n_neighbors=15)
-#     sc.tl.umap(cur_adata)
-#     print(cur_adata.obsm.keys())
-#     print(cur_adata.layers.keys())
-#     sc.pl.umap(cur_adata, color=['sample', 'cell_type', 'low_res_cell_type', 'CD8'], wspace=0.4, return_fig=True)
-# resting_adata.write_h5ad('/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/resting_data_with_scores_annotated.h5ad')
-# stim_adata.write_h5ad('/home/labs/nyosef/eitangr/pixelgen/PixelGen/datasets/stim_data_with_scores_annotated.h5ad')
 
 # def significant_hits_by_cluster_size(adata, neighbors_key_lst, latent_name_lst, distr_key):
 #     '''
@@ -1212,3 +576,416 @@ def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, v
 
 #     de_df = pd.DataFrame(de)
 #     return de_df
+
+# Old function (before hotspot) - did not generate good data
+# def convert_edgelist_to_protein_pair_colocalization(pg_edgelist, adata, nbhd_radius=1, pxl_type='a', components=None, verbose='tqdm', 
+#                                                     detailed_info=False, count_layer='counts',
+#                                                     score_types=['autocorr', 'coloc']):
+#     '''
+#     ----OLD-----
+
+#     Converts the edgelist from pg_data.edgelist into a table that describes colocalization of pairs of proteins in small neighborhoods in the graph.
+#     components (optional): subset of components on which to calculate
+#     pg_edgelist: edgelist containing at least all of the components detailed in "components"
+#     verbose: 'tqdm' or True for a progress bar, an integer v for a checkpoint every v components, False for nothing
+#     Returns pandas DataFrame with index and columns (marker_1, marker_2) for each pair.
+#     count_layer: the layer from pg_data.adata from which to take raw marker counts for frequency estimation.
+#     The values are calculated conceptually as follows for every component:
+#     close_pixel_pairs = set of pairs of pixels with distance <= nbhd_size from each other
+#     for every two markers m1, m2:
+#     score[(m1, m2)] = \sum_{pair \in close_pixel_pairs} 1{m1 in pixel1 and m2 in pixel2}
+#     '''
+
+#     assert pxl_type in ('a', 'b')
+
+#     if components is None:
+#         components = adata.obs_names
+
+#     # marker_pair_coloc_by_component_list = []
+#     marker_pair_intrsct_list = []
+#     marker_pair_union_list = []
+
+#     assert all([t in ('autocorr', 'coloc') for t in score_types])
+
+#     layers = {'actual': int, 'expected': float, 'variance': float, 'z': float, 'normalization': int}
+
+#     results = {score_type: {layer: [] for layer in layers.keys()} for score_type in score_types}
+
+#     if detailed_info:
+#         detailed_info_dict = {
+#             'upi_connectivity': [],
+#             'nbhd_marker_counts': [],
+#             'upia_marker_counts': [],
+#             'upib_marker_counts': [],
+#             'upia_to_upia_int': [],
+#         }
+
+#     marker_names = adata.var_names
+#     marker_pair_tuples = get_marker_pair_tuples(marker_names, only_diff=True, ordered_pairs=False) 
+
+#     counts_df = adata.to_df(count_layer)
+
+#     if verbose is not False:
+#         print_w_time('Starting conversion...')
+
+#     iter = tqdm(components) if verbose in (True, 'tqdm') else components
+#     for i_comp, component in enumerate(iter):
+#         # component_edgelist_orig = pg_data.edgelist_lazy.filter(pl.col('component') == component).select(['upia', 'upib', 'marker']).collect().to_pandas()
+#         component_edgelist_orig = pg_edgelist[pg_edgelist['component'] == component]
+
+#         component_counts = counts_df.loc[component]
+#         N = component_counts.sum()
+#         freqs = component_counts / component_counts.sum()
+
+#         upi_s = 'upia_int' if pxl_type == 'a' else 'upib_int'
+#         upi_s_other = 'upib_int' if pxl_type == 'a' else 'upia_int'
+
+#         n_upia_unique = component_edgelist_orig['upia'].nunique()
+#         n_upib_unique = component_edgelist_orig['upib'].nunique()
+
+#         upia_unique = pd.DataFrame({'upi': component_edgelist_orig['upia'].unique(), 'upi_type': 'a', 'upia_int': range(0, n_upia_unique)}).set_index('upi')
+#         upib_unique = pd.DataFrame({'upi': component_edgelist_orig['upib'].unique(), 'upi_type': 'b', 'upib_int': range(n_upia_unique, n_upia_unique + n_upib_unique)}).set_index('upi')
+
+#         # upi_unique = pd.concat((upia_unique, upib_unique), axis=0)
+
+#         # upia_unique = pd.DataFrame(component_edgelist_orig['upia'].unique()).reset_index().rename(columns={0:'upia'}).set_index('upia').rename(columns={'index':'upia_int'})
+#         # upib_unique = pd.DataFrame(component_edgelist_orig['upib'].unique()).reset_index().rename(columns={0:'upib'}).set_index('upib').rename(columns={'index': 'upib_int'})
+
+#         component_edgelist = component_edgelist_orig.join(upia_unique['upia_int'], on='upia').join(upib_unique['upib_int'], on='upib')
+#         upia_upib_int_unique = pd_unique_values(component_edgelist, ['upia_int', 'upib_int'], observed=True)
+
+#         upia_to_marker_counts = component_edgelist.groupby(['upia_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upia_int': 'upi_int'})
+#         upia_to_marker_counts['type'] = 'a'
+#         upib_to_marker_counts = component_edgelist.groupby(['upib_int', 'marker'], observed=True, as_index=False).size().rename(columns={'size': 'Count'}).rename(columns={'upib_int': 'upi_int'})
+#         upib_to_marker_counts['type'] = 'b'
+
+#         base_upi_to_marker_counts = upia_to_marker_counts if pxl_type == 'a' else upib_to_marker_counts
+#         other_upi_to_marker_counts = upib_to_marker_counts if pxl_type == 'a' else upia_to_marker_counts
+
+#         # if group_markers:
+#         #     upi_to_grouped_marker_counts = upi_to_ungrouped_marker_counts.copy()
+#         #     upi_to_grouped_marker_counts['Count'] = 1
+
+#         upi_connectivity = upia_unique if pxl_type =='a' else upib_unique
+#         upi_connectivity = upi_connectivity.reset_index()[[upi_s]].rename(columns={upi_s: f'{upi_s}_0'})
+
+#         for i in range(nbhd_radius):
+#             if i % 2 == 0:
+#                 upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upi_s)[upi_s_other], on=f'{upi_s}_{i}').rename(columns={upi_s_other: f'{upi_s_other}_{i+1}'})
+#             else:
+#                 upi_connectivity = upi_connectivity.join(upia_upib_int_unique.set_index(upi_s_other)[upi_s], on=f'{upi_s_other}_{i}').rename(columns={upi_s:f'{upi_s}_{i+1}'})
+
+#             upi_connectivity = pd_unique_values(upi_connectivity, col_names=upi_connectivity.columns.values, observed=True)
+
+#         last_is_other = nbhd_radius % 2 != 0
+#         last_pixel_type = upi_s_other if last_is_other else upi_s
+#         last_pixel_type_marker_counts = other_upi_to_marker_counts if last_is_other else base_upi_to_marker_counts
+
+#         pxl_0 = f'{upi_s}_0'
+#         pxl_n = f'{last_pixel_type}_{nbhd_radius}'
+#         center_pxl = f'nbhd_center_upi_int'
+
+#         # center_marker = 'marker_1'
+#         # nbhd_marker = 'marker_2'
+
+#         # center_count = 'Count_1'
+#         # nbhd_count = 'Count_2'            
+
+#         # print(upi_connectivity)
+#         upi_connectivity_short = pd_unique_values(upi_connectivity, col_names=[pxl_0, pxl_n], observed=True)
+
+#         # Count each pair of pixels only once
+#         # upi_connectivity = upi_connectivity[upi_connectivity[center_pxl] <= upi_connectivity[nbhd_pxl]]
+
+#         upi_total_counts = base_upi_to_marker_counts.groupby('upi_int', observed=True)['Count'].sum()
+
+#         nbhds_markers = upi_connectivity_short.join(last_pixel_type_marker_counts.set_index('upi_int')[['marker', 'Count']], on=pxl_n)[[pxl_0, 'marker', 'Count']].rename(
+#             columns={pxl_0: center_pxl}).groupby([center_pxl, 'marker'], as_index=False, observed=True)['Count'].sum()
+#         nbhds_total_counts = nbhds_markers.groupby(center_pxl, observed=True)['Count'].sum()
+
+#         # nbhds_markers = nbhds_markers.groupby([center_pxl, 'marker'], observed=True)['Count'].sum().reset_index().rename(columns={0: 'Count'})
+#         # if group_markers:
+#         #     nbhds_markers['Count'] = 1
+#         # nbhds_markers['Count'] = nbhds_markers['Count'].astype(int)
+
+#         # Table showing marker counts per pixel
+
+#         upi_markers_pivoted = pd.pivot_table(base_upi_to_marker_counts, values='Count', index='upi_int', columns='marker', observed=True, fill_value=0).astype(int)
+
+#         # Table showing marker counts per neighborhood (each nbhd is defined by a center pixel; neighborhoods overlap)
+#         nbhds_markers_pivoted = pd.pivot_table(nbhds_markers, values='Count', index=center_pxl, columns='marker', observed=True, fill_value=0,).astype(int)
+
+#         for marker in marker_names:
+#             for tbl in (upi_markers_pivoted, nbhds_markers_pivoted):
+#                 if marker not in tbl.columns:
+#                     tbl[marker] = 0
+        
+
+
+#         def f(p):
+#             return p*(1-p)
+        
+#         def g(p, n):
+#             return np.power(1-p, n)
+        
+#         if results.get('autocorr'):
+
+#             autocorr = pd.Series(
+#                 [((upi_total_counts)*(nbhds_markers_pivoted[m] > 0).astype(int)).sum(axis=0) for m in marker_names],
+#                 index=marker_names
+#             )
+
+#             expected_autocorr = pd.Series(
+#                 [N - ((upi_total_counts)*g(freqs[m], nbhds_total_counts)).sum(axis=0) for m in marker_names],
+#                 index=marker_names
+#             )
+
+#             variance_autocorr = pd.Series(
+#                 [(np.square(upi_total_counts)*f(g(freqs[m], nbhds_total_counts))).sum(axis=0) for m in marker_names],
+#                 index=marker_names
+#             )
+
+#             results['autocorr']['actual'].append(autocorr)
+#             results['autocorr']['expected'].append(expected_autocorr)
+#             results['autocorr']['variance'].append(variance_autocorr)
+#             results['autocorr']['z'].append(((autocorr - expected_autocorr) / np.sqrt(variance_autocorr)).replace([np.inf, -np.inf, np.nan], 0))
+
+
+#         def h(p1, p2, n):
+#             return np.power(1-p1, n) + np.power(1-p2, n) - np.power(1-p1-p2, n)
+        
+#         if results.get('coloc'):
+
+
+#             coloc = pd.Series(
+#                 [((upi_total_counts)*((nbhds_markers_pivoted[m1] > 0).astype(int) & (nbhds_markers_pivoted[m2] > 0).astype(int))).sum(axis=0) for m1, m2 in marker_pair_tuples],
+#                 index=marker_pair_tuples,
+#             )
+
+#             normalization_coloc = pd.Series(
+#                 [((upi_total_counts)*((nbhds_markers_pivoted[m1] > 0).astype(int) | (nbhds_markers_pivoted[m2] > 0).astype(int))).sum(axis=0) for m1, m2 in marker_pair_tuples],
+#                 index=marker_pair_tuples,
+#             )
+
+#             expected_coloc = pd.Series(
+#                 [N - ((upi_total_counts)*(h(freqs[m1], freqs[m2], nbhds_total_counts))).sum(axis=0) for m1, m2 in marker_pair_tuples],
+#                 index=marker_pair_tuples,
+#             )
+
+#             variance_coloc = pd.Series(
+#                 [(np.square(upi_total_counts)*(f(h(freqs[m1], freqs[m2], nbhds_total_counts)))).sum(axis=0) for m1, m2 in marker_pair_tuples],
+#                 index=marker_pair_tuples,
+#             )
+
+
+#             results['coloc']['actual'].append(coloc)
+#             results['coloc']['expected'].append(expected_coloc)
+#             results['coloc']['normalization'].append(normalization_coloc)
+#             results['coloc']['variance'].append(variance_coloc)
+#             results['coloc']['z'].append(((coloc - expected_coloc) / np.sqrt(variance_coloc)).replace([np.inf, -np.inf, np.nan], 0))
+
+
+#         # nbhds_m2_binary = []
+#         # upi_m1 = []
+#         # upi_total_times_binary = []
+#         # m1_freqs = []
+#         # m2_freqs = []
+#         # m1_total = []
+#         # prob_no_m2_in_nbhds = []
+
+#         # pixel_sum_proportion = {}
+
+
+#         # for m1, m2 in marker_pair_tuples:
+#         #     if m1 != m2:
+#         #         cur_m2_binary = (nbhds_markers_pivoted[m2] > 0).astype(int)
+#         #     else:
+#         #         cur_m2_binary = (nbhds_markers_pivoted[m2] > 1).astype(int)
+#         #     nbhds_m2_binary.append(cur_m2_binary)
+#         #     upi_m1.append(upi_markers_pivoted[m1])
+#         #     upi_total_times_binary.append(upi_total_counts*cur_m2_binary)
+#         #     # prob_no_m2_in_nbhds.append(np.power(1 - component_freqs[m2], nbhds_total_counts))
+
+#         #     m1_freqs.append(component_freqs[m1])
+#         #     m1_total.append(component_counts[m1])
+#         #     m2_freqs.append(component_freqs[m2])
+
+
+
+#         # # nbhds_m2_binary, upi_m1, upi_total_times_binary, prob_no_m2_in_nbhds  = [pd.DataFrame(l, index=marker_pair_tuples).T for l in  
+#         # #         (nbhds_m2_binary, upi_m1, upi_total_times_binary, prob_no_m2_in_nbhds)]
+        
+#         # nbhds_m2_binary, upi_m1, upi_total_times_binary = [pd.DataFrame(l, index=marker_pair_tuples).T for l in  
+#         #         (nbhds_m2_binary, upi_m1, upi_total_times_binary)]
+        
+#         # m1_freqs, m2_freqs, m1_total = [pd.Series(l, index=marker_pair_tuples) for l in (m1_freqs, m2_freqs, m1_total)]
+                
+#         # coloc = pd.Series((upi_m1*nbhds_m2_binary).sum(axis=0), index=marker_pair_tuples)
+#         # expected_coloc = pd.Series(m1_freqs*(upi_total_times_binary).sum(axis=0), index=marker_pair_tuples)
+#         # variance_coloc = pd.Series((m1_freqs)*(1-m1_freqs)*(upi_total_times_binary).sum(axis=0), index=marker_pair_tuples)
+#         # # experimental_exp = pd.Series(
+#         # #     m1_total - (m1_freqs / (1 - m2_freqs))*(prob_no_m2_in_nbhds.mul(upi_total_counts, axis=0)).sum(axis=0),
+#         # #     index=marker_pair_tuples
+#         # # )
+#         # # experimental_variance = pd.Series(
+#         # #     (m1_freqs / (1 - m2_freqs)).pow(2) * (prob_no_m2_in_nbhds*(1 - prob_no_m2_in_nbhds).mul(upi_total_counts.pow(2), axis=0)).sum(axis=0) + \
+#         # #     + m1_freqs*(1 - m1_freqs - m2_freqs) / (1 - m2_freqs).pow(2) * (prob_no_m2_in_nbhds.mul(upi_total_counts, axis=0)).sum(axis=0),
+#         # #     index=marker_pair_tuples,
+#         # # )
+
+#                 # coloc_list.append(coloc)
+#         # expected_coloc_list.append(expected_coloc)
+#         # variance_coloc_list.append(variance_coloc)
+
+
+#         '''
+#         # For markers m1 and m2, the contribution of every pixel k to coloc(m1,m2) is the count of m1 in k, if the neighborhood of k includes at least one marker m2
+#         coloc = pd.Series(
+#             [
+#                 (upi_markers_pivoted[m1]*(nbhds_markers_pivoted[m2].astype(bool).astype(int))).sum() for m1, m2 in marker_pair_tuples
+#             ], index=marker_pair_tuples
+#         )
+
+
+#         # Expected value of coloc(m1,m2) under null hypothesis is the cell-wide frequency of m1 times the sum of molecules in the vicinity of m2 molecules
+#         expected_coloc = pd.Series(
+#             [
+#                 component_freqs[m1]*(
+#                     upi_total_counts*(nbhds_markers_pivoted[m2].astype(bool).astype(int))
+#                 ).sum() for m1, m2 in marker_pair_tuples
+#             ], index=marker_pair_tuples
+#         )
+
+#         # Variance is same but with another factor (1-freq(m1))
+#         variance_coloc = pd.Series(
+#             [
+#                 (1-component_freqs[m1])*component_freqs[m1]*(
+#                     upi_total_counts*(nbhds_markers_pivoted[m2].astype(bool).astype(int))
+#                 ).sum() for m1, m2 in marker_pair_tuples
+#             ], index=marker_pair_tuples
+#         )
+#         '''
+
+        
+#         # marker_pair_coloc = pd.Series(
+#         #     [
+#         #         (nbhds_markers_pivoted[pair[0]]*(nbhds_markers_pivoted[pair[1]].astype(bool).astype(int))).sum() for pair in marker_diff_pair_names
+#         #     ], index=marker_diff_pair_names,
+#         # )
+
+#         # experimental_exp_list.append(experimental_exp)
+#         # experimental_variance_list.append(experimental_variance)
+
+#         if detailed_info:
+#             for (df, name) in zip((nbhds_markers, upia_unique, upia_to_marker_counts, upib_to_marker_counts, upi_connectivity), 
+#                                   ('nbhd_marker_counts', 'upia_to_upia_int', 'upia_marker_counts', 'upib_marker_counts', 'upi_connectivity')):
+#                 df['component'] = component
+#                 detailed_info_dict[name].append(df)
+
+#         # if group_markers:
+#         #     nbhds_markers_pivoted = nbhds_markers_pivoted.astype(bool).astype(int)
+
+
+
+#         # print(nbhds_markers_pivoted)
+
+#         # marker_pairs_intersection = pd.Series(
+#         #     [(nbhds_markers_pivoted[sorted_marker_pair[0]] & nbhds_markers_pivoted[sorted_marker_pair[1]]).sum() for sorted_marker_pair in sorted_marker_pair_names],
+#         #     index=sorted_marker_pair_names
+#         # )
+#         # marker_pairs_union = pd.Series(
+#         #     [(nbhds_markers_pivoted[sorted_marker_pair[0]] | nbhds_markers_pivoted[sorted_marker_pair[1]]).sum() for sorted_marker_pair in sorted_marker_pair_names],
+#         #     index=sorted_marker_pair_names,
+#         # )
+
+#         # marker_pair_intrsct_list.append(marker_pairs_intersection)
+#         # marker_pair_union_list.append(marker_pairs_union)
+
+#         # print(marker_pairs_intersection)
+#         # print(marker_pairs_union)
+
+#         # marker_pairs_pixel_pairs = upi_connectivity.join(upi_to_marker_counts.set_index(upi_s)[['marker', 'Count']], on=center_pxl).rename(columns={'marker': center_marker, 'Count': center_count}).join(
+#         #                     upi_to_marker_counts.set_index(upi_s)[['marker', 'Count']], on=nbhd_pxl
+#         #                 ).rename(columns={'marker': nbhd_marker, 'Count': nbhd_count})
+        
+#         # # Remove same-marker pairs
+#         # marker_pairs_pixel_pairs = marker_pairs_pixel_pairs[marker_pairs_pixel_pairs[center_marker] != marker_pairs_pixel_pairs[nbhd_marker]]
+
+#         # marker_pairs_pixel_pairs['marker_pair'] = [marker_pairs_to_sorted_pairs[(marker_1, marker_2)] for marker_1, marker_2 in zip(marker_pairs_pixel_pairs[center_marker], marker_pairs_pixel_pairs[nbhd_marker])]
+
+#         # marker_pairs_pixel_pairs['Product'] = marker_pairs_pixel_pairs[center_count]*marker_pairs_pixel_pairs[nbhd_count]
+
+#         # marker_pair_counts = marker_pairs_pixel_pairs.groupby('marker_pair')['Product'].sum().rename('Count')
+
+#         # marker_pair_coloc_by_component_list.append(marker_pair_counts.astype(int))
+
+#         if type(verbose) == int:
+#             if i_comp % verbose == 0:
+#                 print_w_time(f'Component {i_comp} finished')
+
+#     if verbose is not False:
+#         print_w_time('Finished conversion!')
+
+#     # marker_pair_coloc_by_component = pd.DataFrame(data=marker_pair_coloc_by_component_list, index=components).fillna(0).astype(int)
+#     # col_names = sorted(list(marker_pair_coloc_by_component.columns))
+#     # marker_pair_coloc_by_component = marker_pair_coloc_by_component[col_names]
+    
+#     # marker_pair_intrsct_df = pd.DataFrame(marker_pair_intrsct_list, index=components, dtype=int)
+#     # marker_pair_union_df = pd.DataFrame(marker_pair_union_list, index=components, dtype=int)
+
+#     # marker_pair_names_tuples = list(marker_pair_intrsct_df.columns.values)
+
+#     for score_type in score_types:
+#         for layer, dtype in layers.items():
+#             results[score_type][layer] = pd.DataFrame(results[score_type][layer], index=components, dtype=dtype)
+
+
+#     # coloc_layers = {}
+
+#     # # for res_name, res_list, res_dtype in zip(('coloc', 'expected_coloc', 'variance_coloc', 'experimental_exp', 'experimental_variance'), 
+#     # #                                          (coloc_list, expected_coloc_list, variance_coloc_list, experimental_exp_list, experimental_variance_list), 
+#     # #                                          (int, float, float, float, float)):
+#     # for res_name, res_list, res_dtype in zip(('coloc', 'expected_coloc', 'variance_coloc'), 
+#     #                                         (coloc_list, expected_coloc_list, variance_coloc_list), 
+#     #                                         (int, float, float)):
+#     #     coloc_layers[res_name] = pd.DataFrame(res_list, index=components, dtype=res_dtype)
+    
+#     # coloc_layers['z_coloc'] = (coloc_layers['coloc'] - coloc_layers['expected_coloc']) / (coloc_layers['variance_coloc']).map(np.sqrt)
+#     # coloc_layers['z_coloc'].replace([np.inf, -np.inf, np.nan], 0, inplace=True)
+
+#     # autocorr_layers = {}
+#     # for res_name, res_list, res_dtype in zip(('autocorr', 'expected_autocorr', 'variance_autocorr'), 
+#     #                                     (autocorr_list, expected_autocorr_list, variance_autocorr_list), 
+#     #                                     (int, float, float)):
+#     #     autocorr_layers[res_name] = pd.DataFrame(res_list, index=components, dtype=res_dtype)
+    
+#     # autocorr_layers['z_coloc'] = (coloc_layers['coloc'] - coloc_layers['expected_coloc']) / (coloc_layers['variance_coloc']).map(np.sqrt)
+#     # autocorr_layers['z_coloc'].replace([np.inf, -np.inf, np.nan], 0, inplace=True)
+
+#     # layers['experimental_z_coloc'] = (layers['coloc'] - layers['experimental_exp']) / (layers['experimental_variance']).map(np.sqrt)
+#     # layers['experimental_z_coloc'].replace([np.inf, -np.inf], 0, inplace=True)
+
+#     if results.get('coloc'):
+#         for df in results['coloc'].values():
+#             # Rename columns to strings instead of tuples
+#             df.rename(
+#                 columns={(m1, m2): pair2str(m1,m2) for m1,m2 in df.columns.values},
+#                 inplace=True
+#             )
+    
+#     ret = dotdict({
+#         'results': results,
+#         'info': dict(nbhd_radius=nbhd_radius, pxl_type=pxl_type, marker_pair_tuples=marker_pair_tuples)
+#     })
+
+#     # return_dict = {
+#     #     'marker_pair_intersection': marker_pair_intrsct_df,
+#     #     'marker_pair_union': marker_pair_union_df,
+#     #     'marker_pair_names_tuples': marker_pair_names_tuples,
+#     # }
+
+#     if detailed_info:
+#         for k, v in detailed_info_dict.items():
+#             ret.info[k] = pd.concat(v, axis=0)
+    
+#     return ret

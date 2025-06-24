@@ -12,8 +12,7 @@ from scipy.interpolate import griddata
 import pandas as pd
 import numpy as np
 
-from PixelGen.pxl_utils import get_rep
-from PixelGen.scvi_utils import calc_PCA
+from PixelGen.scvi_utils import get_rep, calc_PCA
 
 
 def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=None, pca_kwargs={}, neighbors_kwargs={}):

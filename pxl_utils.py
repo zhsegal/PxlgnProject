@@ -521,23 +521,32 @@ def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, v
     )
     hs.create_knn_graph(weighted_graph=False, n_neighbors=knn_neighbors)
     
-    hs_pol = hs.compute_autocorrelations()
-    hs_pol = hs_pol.reset_index().rename(columns={'Gene': 'marker', 'C': 'pol_hs'})
+    pol = hs.compute_autocorrelations()
+    pol = pol.reset_index().rename(columns={'Gene': 'marker', 'C': 'pol_hs_c', 'Z': 'pol_hs_z'})
 
     abundant_markers = [v for v in vars if adata.to_df('counts').loc[component, v] > marker_count_threshold]
-    hs_pol = hs_pol[hs_pol['marker'].isin(abundant_markers)]
+    pol = pol[pol['marker'].isin(abundant_markers)]
 
-    local_correlations = hs.compute_local_correlations(abundant_markers)
+    _ = hs.compute_local_correlations(abundant_markers)
 
-    long_coloc = hs.local_correlation_c.reset_index().melt(id_vars='marker', var_name='marker_2', value_name='coloc_hs').rename(columns={'marker': 'marker_1'})
-    long_coloc = long_coloc[long_coloc['marker_1'] != long_coloc['marker_2']]
-    long_coloc['pair_name'] = [pair2str(m1, m2, sort=True) for m1, m2 in zip(long_coloc['marker_1'], long_coloc['marker_2'])]
-    long_coloc = long_coloc.drop_duplicates(subset='pair_name')
+    coloc_c = hs.local_correlation_c.reset_index().melt(id_vars='marker', var_name='marker_2', value_name='coloc_hs_c').rename(
+        columns={'marker': 'marker_1'})
+    coloc_z = hs.local_correlation_z.reset_index().melt(id_vars='marker', var_name='marker_2', value_name='coloc_hs_z').rename(
+        columns={'marker': 'marker_1'})
+    for coloc_df in (coloc_c, coloc_z):
+        coloc_df['pair_name'] = [
+            pair2str(m1, m2, sort=True) for m1, m2 in zip(coloc_df['marker_1'], coloc_df['marker_2'])
+        ]
+        coloc_df.drop_duplicates(subset='pair_name', inplace=True)
 
-    hs_pol['component'] = component
-    long_coloc['component'] = component
+    coloc = coloc_c.join(coloc_z.set_index('pair_name')['coloc_hs_z'], on='pair_name', validate='1:1')
 
-    return hs_pol, long_coloc
+    coloc = coloc[coloc['marker_1'] != coloc['marker_2']]
+
+    pol['component'] = component
+    coloc['component'] = component
+
+    return pol, coloc
 
 
 # def significant_hits_by_cluster_size(adata, neighbors_key_lst, latent_name_lst, distr_key):

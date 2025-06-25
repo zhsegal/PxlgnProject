@@ -3,6 +3,7 @@ import itertools
 import seaborn as sns
 import pandas as pd
 import numpy as np
+from matplotlib import pyplot as plt
 
 
 def log(s, logger):
@@ -25,6 +26,26 @@ def pair2str(marker_1, marker_2, sort=False):
 
 def str2pair(p):
     return p.strip('()').split(',')
+
+def split_pair_column(df, c, marker_1_name='marker_1', marker_2_name='marker_2'):
+    pairs = [str2pair(s) for s in df[c]]
+    m1, m2 = zip(*pairs)
+    df[marker_1_name] = m1
+    df[marker_2_name] = m2
+    return df
+
+def filter_df_by_two_columns(df, c1, c2, blacklist=[], whitelist=[]):
+    if whitelist:
+        df = df[(df[c1].isin(whitelist)) | (df[c2].isin(whitelist))]
+    if blacklist:
+        df = df[~((df[c1].isin(blacklist)) | (df[c2].isin(blacklist)))]
+    return df
+
+def rank_plot(series, ascending=False, ax=None, **kwargs):
+    if not ax:
+        fig, ax = plt.subplots(1)
+    sns.scatterplot(series.sort_values(ascending=ascending).reset_index(drop=True), ax=ax, **kwargs)
+    return ax
 
 def get_marker_pairs(marker_names, only_diff=True, only_sorted_pairs=True, as_strings=False):
     '''
@@ -79,5 +100,15 @@ def fill_with_mean(arr):
         arr.replace(np.nan, arr.mean(axis=0), inplace=True)
     return arr
 
-def center_feature_matrix(arr):
+def standardize(arr):
     return (arr - arr.mean(axis=0)) / (arr.std(axis=0))
+
+def std_clip(x, c=3):
+    return c * np.tanh(x/c)
+
+def filter_hv(df, std_thresh=None, top_k=None):
+    assert sum([std_thresh is not None, top_k is not None]) == 1
+    if std_thresh is not None:
+        return df.loc[:, df.std(axis=0) > std_thresh]
+    if top_k is not None:
+        return df.loc[:, df.std(axis=0).sort_values(ascending=False)[:top_k].index]

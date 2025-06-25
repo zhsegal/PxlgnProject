@@ -187,7 +187,10 @@ class MultiModalVIMetrics:
         '''
         model_names = self._model_names_pp(model_names, include_mean_baseline=not skip_mean_baseline)
         features = self._features_pp(key=modality, features=features)
-        fig, ax = self._feature_barplot_figure(key=modality, features=features, n_models=len(model_names))
+        fig, ax = self._feature_barplot_figure(key=modality, 
+            n_features=len(features) if auto_filter_features is None else auto_filter_features, 
+            n_models=len(model_names)
+        )
     
         all_errs = {}
         errors_per_feature = self.errors_per_feature if not reconstruction_mean else self.errors_per_feature_means
@@ -228,7 +231,8 @@ class MultiModalVIMetrics:
         features = self._features_pp(key=autocorr_key, features=features)
 
         fig, ax = self._feature_barplot_figure(
-            key=autocorr_key, features=features, n_models=len(model_names), figsize=figsize
+            key=autocorr_key, n_features=len(features) if auto_filter_features is None else auto_filter_features,
+              n_models=len(model_names), figsize=figsize
         )
         autocorr = self.autocorr[autocorr_key].rename_axis('features').reset_index()
         autocorr = autocorr[autocorr['latent'].isin(model_names)]
@@ -340,10 +344,8 @@ class MultiModalVIMetrics:
         features = sorted(features)
         return features
     
-    def _feature_barplot_figure(self, key, features, n_models, figsize=None):
-        if features is not None:
-            n_features = len(features)
-        else:
+    def _feature_barplot_figure(self, key, n_features, n_models, figsize=None):
+        if n_features is None:
             n_features = len(self.adata_distrs[key].columns)
         if n_features > 100:
             raise RuntimeError('Cannot plot bars for more than 100 features')

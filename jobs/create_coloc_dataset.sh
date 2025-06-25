@@ -2,7 +2,7 @@
 
 # To run (example):
 # conda activate pixelgen-scvi
-# ./PixelGen/jobs/create_coloc_dataset.sh ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+# ./PixelGen/jobs/create_coloc_dataset.sh ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 False
 
 
 bsub \

@@ -304,3 +304,283 @@ Resource usage summary:
 
 The output (if any) is above this job summary.
 
+/usr/bin/lua: /apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:173: interrupted!
+stack traceback:
+	[C]: in function 'posix.access'
+	/apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:173: in upvalue 'l_walk'
+	/apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:248: in upvalue 'l_walk_tree'
+	/apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:260: in upvalue 'l_walk_tree'
+	/apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:282: in upvalue 'l_build'
+	/apps/RHEL9/modules/lmod/lmod/libexec/DirTree.lua:298: in function 'DirTree.new'
+	/apps/RHEL9/modules/lmod/lmod/libexec/ModuleA.lua:615: in function 'ModuleA.__new'
+	/apps/RHEL9/modules/lmod/lmod/libexec/ModuleA.lua:687: in function 'ModuleA.singleton'
+	/apps/RHEL9/modules/lmod/lmod/libexec/MName.lua:183: in upvalue 'l_lazyEval'
+	/apps/RHEL9/modules/lmod/lmod/libexec/MName.lua:272: in function 'MName.sn'
+	/apps/RHEL9/modules/lmod/lmod/libexec/Hub.lua:323: in function 'Hub.load'
+	/apps/RHEL9/modules/lmod/lmod/libexec/MainControl.lua:1056: in function 'MC_CheckSyntax.load'
+	/apps/RHEL9/modules/lmod/lmod/libexec/MainControl.lua:1032: in function 'MC_CheckSyntax.always_load'
+	/apps/RHEL9/modules/lmod/lmod/libexec/cmdfuncs.lua:554: in upvalue 'l_usrLoad'
+	/apps/RHEL9/modules/lmod/lmod/libexec/cmdfuncs.lua:582: in function 'Load_Usr'
+	/apps/RHEL9/modules/lmod/lmod/libexec/lmod:514: in function 'main'
+	/apps/RHEL9/modules/lmod/lmod/libexec/lmod:585: in main chunk
+	[C]: in ?
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 421571: <coloc-dataset> in cluster <wexac> Exited
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:01:10 2025
+Job was executed on host(s) <hgn55>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:01:17 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:01:17 2025
+Terminated at Tue Jun 24 16:01:21 2025
+Results reported at Tue Jun 24 16:01:21 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/uropod/uropod_combined.pxl uropod_combined_with_pol 16 False
+------------------------------------------------------------
+
+TERM_OWNER: job killed by owner.
+Exited with exit code 130.
+
+Resource usage summary:
+
+    CPU time :                                   0.58 sec.
+    Max Memory :                                 15 MB
+    Average Memory :                             10.67 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               524273.00 MB
+    Max Swap :                                   -
+    Max Processes :                              4
+    Max Threads :                                7
+    Run time :                                   7 sec.
+    Turnaround time :                            11 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 432961: <coloc-dataset> in cluster <wexac> Exited
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:21:21 2025
+Job was executed on host(s) <lgn04>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:21:24 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:21:24 2025
+Terminated at Tue Jun 24 16:21:59 2025
+Results reported at Tue Jun 24 16:21:59 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+------------------------------------------------------------
+
+Exited with exit code 2.
+
+Resource usage summary:
+
+    CPU time :                                   12.00 sec.
+    Max Memory :                                 453 MB
+    Average Memory :                             301.14 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               523835.00 MB
+    Max Swap :                                   -
+    Max Processes :                              6
+    Max Threads :                                26
+    Run time :                                   36 sec.
+    Turnaround time :                            38 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 435886: <coloc-dataset> in cluster <wexac> Done
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:26:36 2025
+Job was executed on host(s) <hgn47>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:27:18 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:27:18 2025
+Terminated at Tue Jun 24 16:28:16 2025
+Results reported at Tue Jun 24 16:28:16 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   160.00 sec.
+    Max Memory :                                 3519 MB
+    Average Memory :                             1962.00 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               520769.00 MB
+    Max Swap :                                   -
+    Max Processes :                              21
+    Max Threads :                                172
+    Run time :                                   58 sec.
+    Turnaround time :                            100 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 438542: <coloc-dataset> in cluster <wexac> Done
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:31:42 2025
+Job was executed on host(s) <hgn45>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:32:04 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:32:04 2025
+Terminated at Tue Jun 24 16:33:00 2025
+Results reported at Tue Jun 24 16:33:00 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   148.00 sec.
+    Max Memory :                                 3518 MB
+    Average Memory :                             1881.11 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               520770.00 MB
+    Max Swap :                                   -
+    Max Processes :                              21
+    Max Threads :                                172
+    Run time :                                   61 sec.
+    Turnaround time :                            78 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 439562: <coloc-dataset> in cluster <wexac> Done
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:34:07 2025
+Job was executed on host(s) <hgn50>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:34:33 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:34:33 2025
+Terminated at Tue Jun 24 16:35:31 2025
+Results reported at Tue Jun 24 16:35:31 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   136.00 sec.
+    Max Memory :                                 3228 MB
+    Average Memory :                             1945.30 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               521060.00 MB
+    Max Swap :                                   -
+    Max Processes :                              21
+    Max Threads :                                172
+    Run time :                                   65 sec.
+    Turnaround time :                            84 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 440649: <coloc-dataset> in cluster <wexac> Done
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:36:36 2025
+Job was executed on host(s) <hgn41>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:36:50 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:36:50 2025
+Terminated at Tue Jun 24 16:37:47 2025
+Results reported at Tue Jun 24 16:37:47 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/pbmc-pha-v2.0/combined_resting_PHA_data.pxl pbmcs_pha_with_hs 16 True
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   150.00 sec.
+    Max Memory :                                 3386 MB
+    Average Memory :                             1544.78 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               520902.00 MB
+    Max Swap :                                   -
+    Max Processes :                              21
+    Max Threads :                                172
+    Run time :                                   63 sec.
+    Turnaround time :                            71 sec.
+
+The output (if any) is above this job summary.
+
+
+------------------------------------------------------------
+Sender: LSF System <DoNotReply>
+Subject: Job 443152: <coloc-dataset> in cluster <wexac> Done
+
+Job <coloc-dataset> was submitted from host <login3> by user <eitangr> in cluster <wexac> at Tue Jun 24 16:42:32 2025
+Job was executed on host(s) <lgn02>, in queue <long-gpu>, as user <eitangr> in cluster <wexac> at Tue Jun 24 16:42:38 2025
+</home/projects/nyosef/eitangr> was used as the home directory.
+</home/projects/nyosef/eitangr/pixelgen> was used as the working directory.
+Started at Tue Jun 24 16:42:38 2025
+Terminated at Tue Jun 24 16:48:53 2025
+Results reported at Tue Jun 24 16:48:53 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+bash PixelGen/jobs/create_coloc_dataset.lsf ./PixelGen/datasets/uropod/uropod_combined.pxl uropod_combined_with_pol 16 False
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   4951.00 sec.
+    Max Memory :                                 29022 MB
+    Average Memory :                             18477.41 MB
+    Total Requested Memory :                     524288.00 MB
+    Delta Memory :                               495266.00 MB
+    Max Swap :                                   -
+    Max Processes :                              21
+    Max Threads :                                323
+    Run time :                                   378 sec.
+    Turnaround time :                            381 sec.
+
+The output (if any) is above this job summary.
+

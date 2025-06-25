@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 import os
 import contextlib
+import traceback
 
 ISOTYPE_CONTROLS=['mIgG1', 'mIgG2a', 'mIgG2b']
 MARKER_COUNT_THRESHOLD = 10
@@ -91,7 +92,6 @@ if __name__ == '__main__':
 
     if TEST_MODE:
         logger.info('TEST_MODE = True')
-        components = components[:100]
         if not os.path.exists(TEST_EDGELIST_DIR):
             logger.info('Toy edgelist does not exist. Creating...')
 
@@ -106,6 +106,7 @@ if __name__ == '__main__':
             toy_edgelist = pd.read_csv(TEST_EDGELIST_DIR)
         
         edgelist = toy_edgelist
+        components = edgelist['component'].unique()
     
     else:
         logger.info('Loading full edgelist into memory (this could take a few minutes)...')
@@ -128,7 +129,7 @@ if __name__ == '__main__':
                         )
                         return pol, coloc
         except Exception as e:
-            logger.info(f'ERROR IN COMPONENT {component}:\n{e}')
+            logger.info(f'ERROR IN COMPONENT {component}:\n{traceback.format_exc()}')
             return pd.DataFrame(), pd.DataFrame()
 
 
@@ -144,8 +145,18 @@ if __name__ == '__main__':
         pol = pd.concat(all_pol, axis=0, ignore_index=True)
         coloc = pd.concat(all_coloc, axis=0, ignore_index=True)
 
-        adata.uns['pol_hs'] = pol
-        adata.uns['coloc_hs'] = coloc
+        adata.uns['pol_hs_longform'] = pol
+        adata.uns['coloc_hs_longform'] = coloc
+
+        adata.obsm['pol_hs_c'] = pol.pivot_table(
+            index='component', columns='marker', values='pol_hs_c', fill_value=0, observed=True).reindex(adata.obs.index)
+        adata.obsm['pol_hs_z'] = pol.pivot_table(
+            index='component', columns='marker', values='pol_hs_z', fill_value=0, observed=True).reindex(adata.obs.index)
+        
+        adata.obsm['coloc_hs_c'] = coloc.pivot_table(
+            index='component', columns='pair_name', values='coloc_hs_c', fill_value=0, observed=True).reindex(adata.obs.index)
+        adata.obsm['coloc_hs_z'] = coloc.pivot_table(
+            index='component', columns='pair_name', values='coloc_hs_z', fill_value=0, observed=True).reindex(adata.obs.index)
 
         save_dir = NEW_DATASET if not TEST_MODE else TEST_NEW_DATASET
         adata.write_h5ad(save_dir)

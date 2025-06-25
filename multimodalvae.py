@@ -330,8 +330,8 @@ class MultiModalVAE(BaseModuleClass):
                                 by the number of features
             Sequence - custom weights given to the loss of each modality.
             'auto' - Equivalent to passing a list where each modality is weighted by d_main / (n_modalities * d_modality). 
-                    That is, all modalities have the same total weight for their features (d_main / n_modalities), so that if 
-                    each feature contributes 1, the total sum is equal to if the main modality was alone
+                    That is, all modalities have the same total weight for their features (d_main / n_modalities), so that 
+                    the total sum of weights is d_main, same as if the main modality was alone
         param external_kl_weight: Multiply KL term(s) by external_kl_weight (good for debugging)
         param encoder_kwargs: kwargs to init of encoder. Will take precedence over arguments passed outside encoder_kwargs.
         param decoder_kwargs: kwargs to init of decoder. Will take precedence over arguments passed outside decoder_kwargs.

@@ -18,7 +18,7 @@ TEST_MODE="$4"   # "True" for debugging
 cd /home/projects/nyosef/eitangr/pixelgen
 
 if [ "$TEST_MODE" = "True" ]; then
-	python -m PixelGen.jobs.create_coloc_dataset --pxl-file "${PXL_FILE}" --output-name "${OUTPUT_NAME}" --n-threads "${N_THREADS}" --test-mode > PixelGen/jobs/create_coloc_dataset_py.out 2>&1
+	python -m PixelGen.jobs.create_coloc_dataset --pxl-file "${PXL_FILE}" --output-name "${OUTPUT_NAME}" --n-threads "${N_THREADS}" --test-mode True > PixelGen/jobs/create_coloc_dataset_py.out 2>&1
 else
 	python -m PixelGen.jobs.create_coloc_dataset --pxl-file "${PXL_FILE}" --output-name "${OUTPUT_NAME}" --n-threads "${N_THREADS}" > PixelGen/jobs/create_coloc_dataset_py.out 2>&1
 fi

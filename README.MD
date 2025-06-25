@@ -5,7 +5,7 @@ Contents:
 Notebooks (in order of increasing complexity):
 - test.ipynb - Model testing on artifical data
 - CD20_Rituximab.ipynb - Model application on a relatively simple dataset of CD20 polarization
-- CD3_Capping.ipynb - Model application on a dataset of diverse PBMCs undergone CD3 clustering
+- CD3_Capping.ipynb - Model application on a dataset of T cells undergone CD3 clustering
 - uropod.ipynb - Model application on a dataset of uropod formation
 - carT.ipynb - Model application on a dataset of Raji and car-T cells
 

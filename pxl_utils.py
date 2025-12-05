@@ -27,8 +27,8 @@ import plotly.io as pio
 from plotly import subplots
 import nbformat
 
-from PixelGen.scvi_utils import plot_losses
-from PixelGen.common_utils import pd_unique_values, print_w_time, pair2str, str2pair, get_marker_pairs, \
+from scvi_utils import plot_losses
+from common_utils import pd_unique_values, print_w_time, pair2str, str2pair, get_marker_pairs, \
     multiple_correlation, log, fill_with_mean 
 
 from IPython.utils import io

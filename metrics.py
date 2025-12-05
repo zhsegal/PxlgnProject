@@ -1,18 +1,31 @@
 from collections.abc import Iterable, Sequence, Iterator
 from typing import Callable, Literal, Optional, Union
+from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
 
 from matplotlib import pyplot as plt
 import seaborn as sns
-
+import torch
 import scanpy as sc
 import scipy
+from scipy.stats import norm
+
 from scipy.sparse import csr_matrix, coo_array
 from scipy.interpolate import griddata
-
+from torch import tensor,float32
 import pandas as pd
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    normalized_mutual_info_score as NMI,
+    adjusted_rand_score as ARI,
+    calinski_harabasz_score as CH,
+    davies_bouldin_score as DB,
+    silhouette_score as SIL,
+)
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 
-from PixelGen.scvi_utils import get_rep, calc_PCA
+from scvi_utils import get_rep, calc_PCA
 
 
 def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=None, pca_kwargs={}, neighbors_kwargs={}):
@@ -71,7 +84,9 @@ class MultiModalVIMetrics:
         models : dict,
         mean_baseline=True,
         pca_key='X_pca',
-        compute_autocorrelation=True,
+        biological_key='cell_type',
+        batch_key=None,
+        compute_autocorrelation=False,
         additional_autocorr_keys=[]
     ):
         self.adata = adata.copy()
@@ -93,14 +108,330 @@ class MultiModalVIMetrics:
             **{k: self.adata.obsm[k] for k in additional_autocorr_keys},
         }
         self.autocorr_keys = sorted(list(self.adata_distrs.keys()))
+        self.biological_key=biological_key
+        self.batch_key=batch_key
     
     def run(self):
+        self._compute_negative_log_liklihood()
         self._compute_reconstructions()
         self._compute_squared_errors()
         self._compute_latents()
         if self.compute_autocorrelation:
             self._compute_autocorrelation()
+        
+        self._compute_scib_metrics()
+        self._compute_latent_quality_metrics()
+        self._compute_latent_comparison_metrics()
+        
     
+    def _match_dimensions(self, Xa, Xb):
+        """Reduce higher-dim embedding with PCA to match the lower dimension."""
+        da, db = Xa.shape[1], Xb.shape[1]
+        if da == db:
+            return Xa, Xb
+        dmin = min(da, db)
+        if da > dmin:
+            Xa = PCA(n_components=dmin, random_state=0).fit_transform(Xa)
+        if db > dmin:
+            Xb = PCA(n_components=dmin, random_state=0).fit_transform(Xb)
+        return Xa, Xb
+    
+    
+    def _neighbor_rank_distance_pair(self,Xa,Xb,metric="euclidean"):
+        """Mean symmetric NRD between Xa and Xb (dims already matched)."""
+        n = Xa.shape[0]
+
+        # A→B
+        nn_b = NearestNeighbors(n_neighbors=n, metric=metric).fit(Xb)
+        neigh_idx_ab = nn_b.kneighbors(Xa, return_distance=False)
+        ranks_ab = [np.where(neigh_idx_ab[i] == i)[0][0] + 1 for i in range(n)]
+
+        # B→A
+        nn_a = NearestNeighbors(n_neighbors=n, metric=metric).fit(Xa)
+        neigh_idx_ba = nn_a.kneighbors(Xb, return_distance=False)
+        ranks_ba = [np.where(neigh_idx_ba[i] == i)[0][0] + 1 for i in range(n)]
+
+        return ((np.array(ranks_ab) + np.array(ranks_ba)) / 2).mean()
+    
+    def _lisi_enrichment_score_pair(self, Xa, Xb, k=30, metric="euclidean"):
+        """Mean 2-modality LISI enrichment score between Xa and Xb (dims already matched)."""
+        X = np.vstack([Xa, Xb])
+        labels = np.array(["A"] * Xa.shape[0] + ["B"] * Xb.shape[0])
+        n = X.shape[0]
+
+        nn = NearestNeighbors(n_neighbors=k+1, metric=metric).fit(X)
+        neigh_idx = nn.kneighbors(X, return_distance=False)[:, 1:]
+
+        scores = [np.mean(labels[neigh_idx[i]] == labels[i]) for i in range(n)]
+        mean_score = np.mean(scores)
+
+        # expected baseline
+        _, counts = np.unique(labels, return_counts=True)
+        props = counts / counts.sum()
+        expected = np.sum(props**2)
+
+        return mean_score / expected
+
+        
+    def _compute_latent_comparison_metrics(self):
+        latents = list(self.models.keys()) + [self.pca_key]
+        index_dict = {f"latent{i+1}": name for i, name in enumerate(latents)}
+
+        results = []
+        for i, la in enumerate(latents):
+            for j, lb in enumerate(latents):
+                if j <= i:
+                    continue
+                Xa, Xb = self.adata.obsm[la], self.adata.obsm[lb]
+                Xa, Xb = self._match_dimensions(Xa, Xb)
+
+                nrd = self._neighbor_rank_distance_pair(Xa, Xb)
+                lisi = self._lisi_enrichment_score_pair(Xa, Xb)
+
+                results.append({
+                    "latent_a": f"latent{i+1}",
+                    "latent_b": f"latent{j+1}",
+                    "NRD": nrd,
+                    "LISI": lisi,
+                })
+
+        self.latent_comparison_results = pd.DataFrame(results)
+        self.latent_index=index_dict
+        
+    def plot_latent_comparison_metrics(self):
+        """
+    Plot NRD and LISI results for latent pairs with short latent indices.
+    """
+        sns.set(style="whitegrid", context="talk")
+
+        df_melt = self.latent_comparison_results.melt(
+            id_vars=["latent_a", "latent_b"],
+            value_vars=["NRD", "LISI"],
+            var_name="Metric",
+            value_name="Score"
+        )
+        df_melt["pair"] = df_melt["latent_a"] + " vs " + df_melt["latent_b"]
+
+        metrics = df_melt["Metric"].unique()
+        n_metrics = len(metrics)
+
+        fig, axes = plt.subplots(1, n_metrics, figsize=(6*n_metrics, 5), sharey=False)
+
+        if n_metrics == 1:
+            axes = [axes]
+
+        palette = sns.color_palette("Set2", len(df_melt["pair"].unique()))
+
+        for i, metric in enumerate(metrics):
+            ax = axes[i]
+            sub = df_melt[df_melt["Metric"] == metric]
+            sns.barplot(
+            data=sub,
+            x="pair", y="Score",
+            hue="pair", dodge=False, legend=False,
+            palette=palette,
+            ax=ax
+                )
+            ax.set_title(metric)
+            ax.set_xlabel("Latent Pair")
+            ax.set_ylabel("Score")
+            ax.tick_params(axis="x", rotation=30)
+
+            # add numeric labels
+            for p in ax.patches:
+                ax.annotate(f"{p.get_height():.2f}",
+                            (p.get_x() + p.get_width() / 2., p.get_height()),
+                            ha="center", va="bottom", fontsize=10, color="black", xytext=(0, 3),
+                            textcoords="offset points")
+        fig.tight_layout()
+        return self.latent_index
+        
+    
+    
+    def _compute_latent_quality_metrics(self):
+        latents = list(self.models.keys()) + [self.pca_key]
+        label_key=self.biological_key
+        n_clusters="auto"
+        
+        results = []
+
+        y_true = self.adata.obs[label_key].astype("category")
+        mask = ~y_true.isna()
+        y_true_labeled = y_true[mask]
+
+        if isinstance(n_clusters, str) and n_clusters == "auto":
+            k = y_true_labeled.cat.categories.size
+        else:
+            k = int(n_clusters)
+
+        for obsm_key in latents:
+            X = self.adata.obsm[obsm_key][mask]
+
+            km = KMeans(n_clusters=k, n_init="auto")
+            y_pred = km.fit_predict(X)
+
+            # scores
+            nmi = NMI(y_true_labeled, y_pred)
+            ari = ARI(y_true_labeled, y_pred)
+            ch  = CH(X, y_pred)
+            db  = DB(X, y_pred)
+            sil = SIL(X, y_pred, metric="euclidean") if np.unique(y_pred).size > 1 else np.nan
+
+            results.append({
+                "latent": obsm_key,
+                "NMI": nmi,
+                "ARI": ari,
+                "Calinski_Harabasz": ch,
+                "Davies_Bouldin": db,
+                "Silhouette": sil,
+            })
+
+        self.latent_quality_results = pd.DataFrame(results).set_index("latent")
+        
+    def plot_latent_quality_metrics(self):
+        sns.set(style="whitegrid", context="talk")
+
+        df_melt = self.latent_quality_results.reset_index().melt(id_vars="latent", 
+                                                var_name="Metric", 
+                                                value_name="Score")
+
+        metrics = self.latent_quality_results.columns
+        n_metrics = len(metrics)
+
+        fig, axes = plt.subplots(1, n_metrics, figsize=(10*n_metrics, 10), sharey=False)
+
+        if n_metrics == 1:
+            axes = [axes]
+
+        palette = sns.color_palette("Set2", len(self.latent_quality_results))
+
+        for i, metric in enumerate(metrics):
+            ax = axes[i]
+            sns.barplot(
+            data=df_melt[df_melt["Metric"] == metric],
+            x="latent", y="Score",
+            hue="latent",       # explicitly tie colors to latent
+            dodge=False,        # don’t split bars
+            legend=False,       # avoid duplicate legend
+            palette=palette,
+            ax=ax
+        )
+            ax.set_title(metric)
+            ax.set_xlabel("Latent Embedding")
+            ax.set_ylabel("Score")
+            ax.tick_params(axis="x", rotation=30)
+        
+        fig.tight_layout()
+        
+        return self.latent_quality_results
+        
+    
+    def _compute_scib_metrics(self):
+        latents = list(self.models.keys()) + [self.pca_key]
+        
+        bm = Benchmarker(
+        self.adata,
+        label_key=self.biological_key,
+        batch_key=self.batch_key,
+        bio_conservation_metrics=BioConservation(),
+        batch_correction_metrics=BatchCorrection(),
+        embedding_obsm_keys=latents,
+        
+    )
+                
+        bm.benchmark()
+        self.bm=bm
+        
+    def _compute_negative_log_liklihood(self):
+        self.nll = {}
+
+        # loop over trained models
+        for model_name, model in self.models.items():
+            recon = model.get_normalized_expression(
+                return_l2_error=True, return_px_distrs=True,
+                use_mean_latent=True, return_mean_expression=False
+            )
+            model_results = {}
+
+            for mod_name, mod in self.adata_modalities.items():
+                if mod_name in recon["distrs"].keys():
+                    X = torch.tensor(np.asarray(mod), dtype=torch.float32)
+                    distr = recon["distrs"][mod_name]
+                    log_probs = distr.log_prob(X)
+                    nll_matrix = -log_probs.detach().cpu().numpy()
+                    model_results[mod_name] = nll_matrix.mean()
+            self.nll[model_name] = model_results
+
+        # ------------------------
+        # compute baseline per modality
+        # ------------------------
+        baseline_results = {}
+        for mod_name, mod in self.adata_modalities.items():
+            X = np.asarray(mod)
+            mu = X.mean(axis=0)
+            var = X.var(axis=0) + 1e-6  # avoid zero variance
+            std = np.sqrt(var)
+
+            # logpdf under Gaussian baseline
+            log_probs = norm(loc=mu, scale=std).logpdf(X)
+            nll_matrix = -log_probs
+            baseline_results[mod_name] = nll_matrix.mean()
+
+        self.nll["baseline"] = baseline_results
+                
+            
+    def plot_negative_likelihood(self):
+    # Convert dict -> tidy DataFrame
+        df = pd.DataFrame(self.nll).T  # rows = models (including "baseline"), cols = modalities
+        df = df.reset_index().melt(id_vars="index", var_name="modality", value_name="NLL")
+        df = df.rename(columns={"index": "model"})
+
+        # Ensure baseline always comes last in plotting order
+        model_order = [m for m in df["model"].unique() if m != "baseline"] + ["baseline"]
+
+        modalities = df["modality"].unique()
+        n_mods = len(modalities)
+
+        sns.set(style="whitegrid", context="talk")
+        fig, axes = plt.subplots(1, n_mods, figsize=(6 * n_mods, 5), sharey=False)
+        if n_mods == 1:
+            axes = [axes]
+
+        for i, mod in enumerate(modalities):
+            ax = axes[i]
+            sub = df[df["modality"] == mod]
+
+            # Differentiate baseline with a distinct color
+            palette = {
+                m: "gray" if m == "baseline" else c
+                for m, c in zip(model_order, sns.color_palette("Set2", len(model_order)))
+            }
+
+            sns.barplot(
+                data=sub,
+                x="model", y="NLL",
+                hue="model", dodge=False, legend=False,
+                order=model_order,
+                palette=palette, ax=ax
+            )
+
+            ax.set_title(f"Modality: {mod}")
+            ax.set_xlabel("Model")
+            ax.set_ylabel("Global NLL")
+            ax.tick_params(axis="x", rotation=30)
+
+            # annotate bar values
+            for p in ax.patches:
+                ax.annotate(f"{p.get_height():.3f}",
+                            (p.get_x() + p.get_width() / 2., p.get_height()),
+                            ha="center", va="bottom", fontsize=10, color="black", xytext=(0, 3),
+                            textcoords="offset points")
+
+        fig.tight_layout()
+
+        
+        
+        
     def _compute_reconstructions(self):
         self.reconstructions = {}
         self.reconstruction_means = {}
@@ -158,7 +489,10 @@ class MultiModalVIMetrics:
                 rep_key=mod,
             )
         
-
+    def plot_scib_metrics(self):
+        return self.bm.plot_results_table()
+        
+    
     def mean_modality_errors_barplot(self, model_names=None, reconstruction_mean=False, skip_mean_baseline=False,):
         model_names = self._model_names_pp(model_names, include_mean_baseline= not skip_mean_baseline)
         errs = self.mean_modality_errors if not reconstruction_mean else self.mean_modality_errors_means
@@ -357,11 +691,14 @@ class MultiModalVIMetrics:
         return fig, ax
     
     def _modalities_barplot_figure(self,):
-        fig, axes = plt.subplots(1, len(self.modalities), figsize=(4*len(self.modalities), 4))
+        n_mods = len(self.modalities)
+        fig, axes = plt.subplots(1, len(self.modalities), figsize=(8*len(self.modalities), 8))
+        if n_mods == 1:
+            axes = [axes]
         return fig, axes
     
     def _autocorr_barplot_figure(self,):
-        fig, axes = plt.subplots(1, len(self.autocorr_keys), figsize=(4*len(self.autocorr_keys), 4))
+        fig, axes = plt.subplots(1, len(self.autocorr_keys), figsize=(8*len(self.autocorr_keys), 8))
         return fig, axes
     
     def _move_legend(self, ax):

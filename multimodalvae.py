@@ -45,7 +45,8 @@ from scvi.data import AnnDataManager
 from torch.distributions import NegativeBinomial, Normal, Beta
 from torch.distributions import kl_divergence as kl
 
-from PixelGen.enums import AggMethod, D
+import sys
+from enums import AggMethod, D
 
 import warnings
 
@@ -146,13 +147,23 @@ class Decoder(nn.Module):
 
         self.distr = distr
 
-        if distr == D.Normal:
+        # if distr == D.Normal:
+        #     self.param_decoders = nn.ModuleDict(
+        #         {
+        #             'loc': nn.Linear(n_hidden, n_output),
+        #             'scale': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
+        #         }
+        #     )
+        
+        if distr.name == 'Normal':
             self.param_decoders = nn.ModuleDict(
                 {
                     'loc': nn.Linear(n_hidden, n_output),
                     'scale': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
                 }
             )
+        
+        
         if distr == D.Beta:
             # alpha, beta decoders based on torch.distributions conventions (alpha = concentration1)
             
@@ -315,6 +326,7 @@ class MultiModalVAE(BaseModuleClass):
         unimodal_kl=True, 
         joint_kl=False, 
         agg_method: AggMethod = AggMethod.AOE_GLOBAL_WEIGHTS,
+        experts_method='POE',
         fixed_latent_weights: Sequence[float] | None = None,
         external_kl_weight: float = 1.0, 
         loss_weights : None | Sequence[float] | Literal['auto'] = None,
@@ -346,7 +358,7 @@ class MultiModalVAE(BaseModuleClass):
         assert isinstance(input_ds, Sequence) and len(input_ds) == n_modalities, "Internal error, illegal input_ds"
 
         self.agg_method = agg_method
-    
+        self.experts_method=experts_method
         if fixed_latent_weights is not None:
             assert self.agg_method == AggMethod.AOE_FIXED_WEIGHTS
             weights = torch.tensor(fixed_latent_weights, requires_grad=False)
@@ -384,7 +396,21 @@ class MultiModalVAE(BaseModuleClass):
         decoder_kwargs_.update(decoder_kwargs)
 
 
-        if self.agg_method == AggMethod.SHARED_ENCODER:
+        # if self.agg_method == AggMethod.SHARED_ENCODER:
+        #     assert (not self.unimodal_kl) and self.joint_kl, "For shared encoder, only joint kl is possible"
+        #     self.encoders = nn.ModuleList([
+        #         Encoder(n_input=sum(input_ds), n_output=n_latent, **encoder_kwargs_)
+        #     ])
+
+        # else:
+        #     self.encoders = nn.ModuleList(
+        #         [
+        #             Encoder(n_input=input_d, n_output=n_latent, **encoder_kwargs_)
+        #             for input_d in self.input_ds
+        #         ]
+        #     )
+            
+        if self.agg_method.name =='SHARED_ENCODER':
             assert (not self.unimodal_kl) and self.joint_kl, "For shared encoder, only joint kl is possible"
             self.encoders = nn.ModuleList([
                 Encoder(n_input=sum(input_ds), n_output=n_latent, **encoder_kwargs_)
@@ -463,7 +489,10 @@ class MultiModalVAE(BaseModuleClass):
 
         sample_shape = (n_samples, ) if n_samples > 1 else torch.Size([])
 
-        if self.agg_method == AggMethod.SHARED_ENCODER:
+        
+        
+        
+        if self.agg_method.name =='SHARED_ENCODER':
             inference_results = [
                 self.encoders[0](torch.cat(inputs, dim=-1))
             ]
@@ -479,22 +508,49 @@ class MultiModalVAE(BaseModuleClass):
         batch_size = means[0].shape[0]
         device = means[0].device
 
-        if self.agg_method == AggMethod.SHARED_ENCODER:
+        if self.agg_method.name == 'SHARED_ENCODER':
             shared_qzm, shared_qzv, shared_z = means[0], vars[0], zs[0]
             inference_results = None
             weights = None
         
         elif self.agg_method in (AggMethod.AOE_FIXED_WEIGHTS, AggMethod.AOE_GLOBAL_WEIGHTS, AggMethod.AOE_PER_CELL_WEIGHTS):
             if self.agg_method in (AggMethod.AOE_FIXED_WEIGHTS, AggMethod.AOE_GLOBAL_WEIGHTS):
-                weights = self.get_global_weights(numpy=False)
-                assert weights.shape == (self.n_modalities, )
-        
+                
+                if self.experts_method=='POE':
+                
+                    eps = 1e-6
+                    precisions, prec_mu = [], []
+                    for modality_num, (mu_m, var_m, input_m) in enumerate(zip(means, vars, inputs)):
+                        var_m = torch.clamp(var_m, min=eps)
+                        lambda_m = 1.0 / var_m
+
+                        if modality_num == 1:  
+                            missing_mask = (input_m == 0).all(dim=1) | (input_m == 1000).all(dim=1)
+                            lambda_m[missing_mask, :] = 0.0
+                            mu_m[missing_mask, :] = 0.0
+
+                        precisions.append(lambda_m)
+                        prec_mu.append(lambda_m * mu_m)
+
+                    Lambda = torch.stack(precisions, dim=0).sum(dim=0)
+                    eta = torch.stack(prec_mu, dim=0).sum(dim=0)
+                    shared_qzv = torch.clamp(1.0 / (Lambda + eps), min=eps)
+                    shared_qzm = shared_qzv * eta
+                    weights = self.get_global_weights(numpy=False)
+                    assert weights.shape == (self.n_modalities, )
+                    
+                elif self.experts_method=='MOE':
+                    weights = self.get_global_weights(numpy=False)
+                    assert weights.shape == (self.n_modalities, )
+                    shared_qzm = self._weighted_sum(means, weights)
+                    shared_qzv = self._weighted_sum(vars, torch.square(weights))
+                
+                
             elif self.agg_method in (AggMethod.AOE_PER_CELL_WEIGHTS,):
                 weights = self.get_per_cell_weights(inputs, grad=True, numpy=False)
                 assert weights.shape == (batch_size, self.n_modalities)
             
-            shared_qzm = self._weighted_sum(means, weights)
-            shared_qzv = self._weighted_sum(vars, torch.square(weights))
+            
 
         shared_qz = Normal(shared_qzm, shared_qzv.sqrt())
         shared_z = shared_qz.rsample(sample_shape=sample_shape)
@@ -570,16 +626,28 @@ class MultiModalVAE(BaseModuleClass):
             var_post_dist = inference_outputs['qz']
             kl_divergence += kl(var_post_dist, prior_dist).sum(dim=-1)
 
+        spatial_mask = None
+        if "spatial_masked" in tensors:
+            spatial_mask = tensors["spatial_masked"].to(joint_qzm.device).float().squeeze()
+
         if self.unimodal_kl:
-            for latent_param_dict in inference_outputs['modalities']:
+            for i, latent_param_dict in enumerate(inference_outputs['modalities']):
                 mod_post_dist = Normal(latent_param_dict['qzm'], torch.sqrt(latent_param_dict['qzv']))
-                kl_divergence += kl(mod_post_dist, prior_dist).sum(dim=-1)
+                mod_kl=kl(mod_post_dist, prior_dist).sum(dim=-1)
+                if i==1 and spatial_mask in tensors:
+                    kl_divergence += (mod_kl * (1.0 - spatial_mask))
+                else:
+                    kl_divergence += mod_kl
 
     
         inputs = inference_outputs['inputs']
         log_lik = 0
-        for input, distr, loss_weight in zip(inputs, generative_outputs['px_distrs'], self._loss_weights):
+        for i, (input, distr, loss_weight) in enumerate(zip(inputs, generative_outputs["px_distrs"], self._loss_weights)):
             mod_log_lik = distr.log_prob(input).sum(dim=-1)
+            
+            if i == 1 and "spatial_masked" in tensors:                
+                mod_log_lik = mod_log_lik * (1.0 - spatial_mask)                    
+                   
             log_lik += loss_weight*mod_log_lik
 
         elbo = log_lik - kl_weight*self.external_kl_weight*kl_divergence

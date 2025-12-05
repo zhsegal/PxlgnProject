@@ -44,9 +44,12 @@ from scvi.data import AnnDataManager
 from torch.distributions import NegativeBinomial, Normal, Beta
 from torch.distributions import kl_divergence as kl
 
-from PixelGen.multimodalvae import MultiModalVAE
-from PixelGen.enums import AggMethod
-from PixelGen.scvi_utils import DistributionConcatenator
+import sys
+sys.path.append('/home/projects/nyosef/zvise/PixelGen/PixelGen')
+
+from multimodalvae import MultiModalVAE
+from enums import AggMethod
+from scvi_utils import DistributionConcatenator
 
 import warnings
 
@@ -121,6 +124,7 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         n_modalities = 1,
         extra_modality_keys = [],
         is_count_data: bool = False,
+        spatial_mask_key: str | None = None,
         **kwargs,
     ) -> AnnData | None:
         '''
@@ -146,6 +150,14 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         ] + [
             ObsmField(REGISTRY_MODALITY_KEYS[i+1], key) for i, key in enumerate(extra_modality_keys)
         ]
+         # 🟩 NEW: register spatial mask if provided
+        if spatial_mask_key is not None:
+            if spatial_mask_key not in adata.obs:
+                raise KeyError(f"spatial_mask_key '{spatial_mask_key}' not found in adata.obs.")
+            anndata_fields.append(
+                NumericalObsField("spatial_masked", spatial_mask_key, required=True)
+            )
+        
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)

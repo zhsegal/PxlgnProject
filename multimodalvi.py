@@ -354,6 +354,7 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 inference_outputs = self.module.inference(**inference_inputs, n_samples=n_samples)
                 if use_mean_latent:
                     inference_outputs['z'] = inference_outputs['qzm']
+                    inference_outputs['modality_z'] = inference_outputs['modality_zm']
                 generative_inputs = self.module._get_generative_input(tensors=tensors, inference_outputs=inference_outputs)
                 generative_outputs = self.module.generative(**generative_inputs)
                 for mod, i in self.modality_key_to_index.items():

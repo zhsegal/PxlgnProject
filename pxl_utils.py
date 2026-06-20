@@ -549,6 +549,99 @@ def compute_hotspot_pol_and_coloc_single_component(edgelist, adata, component, v
     return pol, coloc
 
 
+def compute_triple_cooccurrence(edgelist, adata, components, triplets, presence_threshold=0,
+                                knn_neighbors=30, n_perm=200, random_state=0, njobs=8, logger=None):
+    '''
+    TRUE per-cell 3-way spatial co-occurrence z-score on the A-pixel graph.
+
+    Gold-standard for validating the cheap pair-derived triplet proxy
+    (utils.build_triplet_obsm). HEAVY: run on a GPU/notebook kernel over a SUBSET of
+    components x triplets.
+
+    edgelist, adata, components: as in compute_hotspot_pol_and_coloc.
+    triplets: iterable of (marker_a, marker_b, marker_c) tuples.
+    presence_threshold: a marker is "present" at a pixel when count > threshold.
+    n_perm: permutations of the per-pixel triple indicator for the null.
+
+    Statistic: per pixel, t = 1[A present]*1[B present]*1[C present]; the triple
+    join-count over the kNN graph (edges with both endpoints in t) is z-scored against
+    n_perm shuffles of t. Returns long-form: component, marker_1/2/3, triplet_name,
+    triple_obs, triple_exp, triple_z.
+    '''
+    triplets = [tuple(sorted(t)) for t in triplets]
+
+    with ProcessPoolExecutor(max_workers=njobs) as executor:
+        futures = [
+            executor.submit(
+                _process_triple_component, component, i, logger,
+                edgelist=edgelist, adata=adata, triplets=triplets,
+                presence_threshold=presence_threshold, knn_neighbors=knn_neighbors,
+                n_perm=n_perm, random_state=random_state,
+            ) for i, component in enumerate(components)
+        ]
+        results = [future.result() for future in futures]
+
+    return pd.concat(results, axis=0, ignore_index=True)
+
+
+def _process_triple_component(component, idx, logger, **kwargs):
+    log(f'Triple calc {idx}', logger)
+    try:
+        with io.capture_output():
+            return compute_triple_cooccurrence_single_component(component=component, **kwargs)
+    except Exception as e:
+        log(f'ERROR IN COMPONENT {component}:\n{e}', logger)
+        return pd.DataFrame()
+
+
+def compute_triple_cooccurrence_single_component(edgelist, adata, component, triplets,
+                                                 presence_threshold=0, knn_neighbors=30,
+                                                 n_perm=200, random_state=0):
+    results = get_pixel_nbhd_counts(edgelist, adata, pxl_type_for_counts='a', nbhd_radius=2,
+                                    components=[component], compute_pixel_graph=True, verbose=False, vars=None)
+    pixel_counts = results['pixel_counts']
+    pivot = pd.pivot_table(pixel_counts, index='upi_int', columns='marker', values='Count',
+                           observed=True, fill_value=0).astype(int)
+    g = results['graphs'][0]
+    distances = dijkstra(g.A, directed=False, unweighted=True)
+
+    # symmetric binary kNN adjacency from graph distances
+    n = distances.shape[0]
+    k = min(knn_neighbors, n - 1)
+    np.fill_diagonal(distances, np.inf)
+    nn = np.argpartition(distances, k, axis=1)[:, :k]
+    rows = np.repeat(np.arange(n), k)
+    cols = nn.ravel()
+    W = csr_matrix((np.ones(rows.size), (rows, cols)), shape=(n, n))
+    W = ((W + W.T) > 0).astype(float)  # symmetrize
+
+    present = (pivot > presence_threshold)
+    rng = np.random.default_rng(random_state)
+
+    rows_out = []
+    for a, b, c in triplets:
+        if not all(m in present.columns for m in (a, b, c)):
+            continue
+        t = (present[a].values & present[b].values & present[c].values).astype(float)
+        n_pos = int(t.sum())
+        if n_pos < 3:  # too few co-occurring pixels to be meaningful
+            continue
+        obs = 0.5 * float(t @ (W @ t))
+        perm = np.empty((n, n_perm))
+        for j in range(n_perm):
+            perm[:, j] = rng.permutation(t)
+        jc = 0.5 * (perm * (W @ perm)).sum(axis=0)
+        exp, sd = jc.mean(), jc.std()
+        z = (obs - exp) / sd if sd > 0 else 0.0
+        rows_out.append({
+            'component': component, 'marker_1': a, 'marker_2': b, 'marker_3': c,
+            'triplet_name': f'{a}/{b}/{c}', 'n_pixels_triple': n_pos,
+            'triple_obs': obs, 'triple_exp': exp, 'triple_z': z,
+        })
+
+    return pd.DataFrame(rows_out)
+
+
 # def significant_hits_by_cluster_size(adata, neighbors_key_lst, latent_name_lst, distr_key):
 #     '''
 #     neighbors_key_lst: neighbor keys to compare

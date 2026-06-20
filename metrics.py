@@ -25,7 +25,7 @@ from sklearn.metrics import (
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 
-from scvi_utils import get_rep, calc_PCA
+from PixelGen.scvi_utils import get_rep, calc_PCA
 
 
 def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=None, pca_kwargs={}, neighbors_kwargs={}):
@@ -38,7 +38,13 @@ def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=Non
     ret = []
 
     for latent_key in latent_keys:
-        calc_PCA(adata, rep=latent_key, key_added=latent_key, **pca_kwargs)
+        dim = adata.obsm[latent_key].shape[1]
+        kw = dict(pca_kwargs)
+        if 'n_comps' in kw:
+            kw['n_comps'] = min(kw['n_comps'], dim)
+            if kw['n_comps'] >= dim:            # arpack requires n_comps < dim
+                kw.setdefault('svd_solver', 'full')
+        calc_PCA(adata, rep=latent_key, key_added=latent_key, **kw)
         sc.pp.neighbors(adata, use_rep=f'{latent_key}_pca', key_added=latent_key, **neighbors_kwargs)
 
     for (latent_key, name) in zip(latent_keys, names):

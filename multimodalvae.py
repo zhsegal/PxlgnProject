@@ -115,7 +115,7 @@ class Decoder(nn.Module):
         n_input: int,
         n_output: int,
         distr: D,
-        dispersion: Literal["gene", "gene-cell"] = 'gene-cell',
+        dispersion: Literal["gene", "gene-cell", "fixed"] = 'gene-cell',
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
         n_hidden: int = 128,
@@ -146,24 +146,28 @@ class Decoder(nn.Module):
         }[decoder_activation]
 
         self.distr = distr
+        self.dispersion = dispersion
+        self.n_output = n_output
 
-        # if distr == D.Normal:
-        #     self.param_decoders = nn.ModuleDict(
-        #         {
-        #             'loc': nn.Linear(n_hidden, n_output),
-        #             'scale': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
-        #         }
-        #     )
-        
         if distr.name == 'Normal':
-            self.param_decoders = nn.ModuleDict(
-                {
-                    'loc': nn.Linear(n_hidden, n_output),
-                    'scale': nn.Sequential(nn.Linear(n_hidden, n_output), self.decoder_activation),
-                }
-            )
-        
-        
+            # loc is always cell-dependent. The scale (dispersion) head controls how much
+            # the decoder can inflate per-cell variance to "cheat" by predicting the
+            # population mean. 'gene-cell' (default, original behaviour) is the most flexible
+            # and the most prone to mean-prediction collapse; 'gene' learns one scale per
+            # feature; 'fixed' clamps scale to 1 (use with standardized/whitened targets).
+            self.param_decoders = nn.ModuleDict({'loc': nn.Linear(n_hidden, n_output)})
+            if dispersion == 'gene-cell':
+                self.param_decoders['scale'] = nn.Sequential(
+                    nn.Linear(n_hidden, n_output), self.decoder_activation
+                )
+            elif dispersion == 'gene':
+                self.px_scale_raw = nn.Parameter(torch.zeros(n_output))
+            elif dispersion == 'fixed':
+                pass
+            else:
+                raise ValueError("dispersion must be one of {'gene', 'gene-cell', 'fixed'}")
+
+
         if distr == D.Beta:
             # alpha, beta decoders based on torch.distributions conventions (alpha = concentration1)
             
@@ -201,6 +205,13 @@ class Decoder(nn.Module):
             params[param_name] = param_decoder(px)
             if self.distr == D.Beta:
                 params[param_name] *= scaling_factor
+
+        if self.distr == D.Normal and self.dispersion != 'gene-cell':
+            if self.dispersion == 'gene':
+                scale = F.softplus(self.px_scale_raw) + self.decoder_param_eps
+                params['scale'] = scale.expand_as(params['loc'])
+            elif self.dispersion == 'fixed':
+                params['scale'] = torch.ones_like(params['loc'])
 
         return params, info
 
@@ -334,6 +345,10 @@ class MultiModalVAE(BaseModuleClass):
         decoder_kwargs = {'dropout_rate': 0,},
         allow_beta_constant = True,
         n_obs: int = 0,
+        batch_mask: Optional[Sequence[bool]] = None,
+        decoder_dispersions: Optional[Sequence[str]] = None,
+        free_bits: float = 0.0,
+        n_private: Union[int, Sequence[int]] = 0,
     ):
         '''
         param distrs: list of distributions for the modalities (including main)
@@ -384,6 +399,29 @@ class MultiModalVAE(BaseModuleClass):
         self.unimodal_kl = unimodal_kl
         self.joint_kl = joint_kl
         self.allow_beta_constant = allow_beta_constant
+        self.free_bits = free_bits
+
+        if decoder_dispersions is None:
+            decoder_dispersions = ['gene-cell'] * self.n_modalities
+        else:
+            assert len(decoder_dispersions) == self.n_modalities, \
+                "decoder_dispersions must have one entry per modality"
+        self.decoder_dispersions = decoder_dispersions
+
+        # Shared + private latent split. n_latent is the *shared* subspace (POE-combined across
+        # modalities); n_private[i] extra dims are encoded only from modality i and decoded only
+        # to modality i, giving each modality a channel the others cannot override. n_private=0
+        # reproduces the original shared-only model.
+        if isinstance(n_private, int):
+            n_private = [n_private] * self.n_modalities
+        else:
+            assert len(n_private) == self.n_modalities, \
+                "n_private must be an int or have one entry per modality"
+        self.n_private = list(n_private)
+        self.n_shared = n_latent
+        if self.agg_method.name == 'SHARED_ENCODER':
+            assert all(p == 0 for p in self.n_private), \
+                "private latents are not supported with SHARED_ENCODER"
         if self.n_modalities == 1:
             # Eliminate double KL
             self.unimodal_kl = True
@@ -419,18 +457,36 @@ class MultiModalVAE(BaseModuleClass):
         else:
             self.encoders = nn.ModuleList(
                 [
-                    Encoder(n_input=input_d, n_output=n_latent, **encoder_kwargs_)
-                    for input_d in self.input_ds
+                    Encoder(n_input=input_d, n_output=n_latent + self.n_private[i], **encoder_kwargs_)
+                    for i, input_d in enumerate(self.input_ds)
                 ]
             )
 
-        self.decoders = nn.ModuleList(
-            [
-                Decoder(n_input=n_latent, n_output=input_d, distr=distr, n_cat_list=[n_batch], **decoder_kwargs_)
-                for input_d, distr in zip(self.input_ds, self.distrs)            
-            ]
-        )
 
+
+
+        # Default: no batch masking for any modality
+        if batch_mask is None:
+            batch_mask = [False] * n_modalities
+
+        self.decoders = nn.ModuleList()
+        for i, (input_d, distr) in enumerate(zip(self.input_ds, self.distrs)):
+
+            # If masked, we pass None to n_cat_list.
+            # FCLayers will simply not build the embedding layer.
+            # When generative() passes batch_index later, FCLayers will ignore it.
+            current_n_cat_list = None if batch_mask[i] else [n_batch]
+            
+            self.decoders.append(
+                Decoder(
+                    n_input=n_latent + self.n_private[i],
+                    n_output=input_d,
+                    distr=distr,
+                    n_cat_list=current_n_cat_list,
+                    dispersion=self.decoder_dispersions[i],
+                    **decoder_kwargs_
+                )
+            )
         if self.agg_method == AggMethod.AOE_GLOBAL_WEIGHTS:
             self.learned_weights = nn.Parameter(torch.ones((self.n_modalities, )))
         elif self.agg_method == AggMethod.AOE_PER_CELL_WEIGHTS:
@@ -465,10 +521,10 @@ class MultiModalVAE(BaseModuleClass):
         if self.agg_method == AggMethod.AOE_GLOBAL_WEIGHTS:
             weights = F.softmax(self.learned_weights, dim=0)
         elif self.agg_method == AggMethod.AOE_FIXED_WEIGHTS:
-            weights = self.fixed_weights.numpy(force=True)
+            weights = self.fixed_weights
         else:
             return None
-        return weights if not numpy else weights.numpy(force=True)
+        return weights.numpy(force=True) if numpy else weights
 
     def get_per_cell_weights(self, inputs, grad=False, numpy=True):
         if self.agg_method != AggMethod.AOE_PER_CELL_WEIGHTS:
@@ -508,6 +564,15 @@ class MultiModalVAE(BaseModuleClass):
         batch_size = means[0].shape[0]
         device = means[0].device
 
+        # Split each encoder posterior into a shared part (first n_shared dims, POE-combined below)
+        # and a modality-private part (the remaining n_private[i] dims). With n_private all 0 the
+        # private slices are empty and behaviour is identical to the shared-only model.
+        n_shared = self.n_shared
+        shared_means = [m[..., :n_shared] for m in means]
+        shared_vars = [v[..., :n_shared] for v in vars]
+        priv_means = [m[..., n_shared:] for m in means]
+        priv_zs = [z[..., n_shared:] for z in zs]
+
         if self.agg_method.name == 'SHARED_ENCODER':
             shared_qzm, shared_qzv, shared_z = means[0], vars[0], zs[0]
             inference_results = None
@@ -517,14 +582,19 @@ class MultiModalVAE(BaseModuleClass):
             if self.agg_method in (AggMethod.AOE_FIXED_WEIGHTS, AggMethod.AOE_GLOBAL_WEIGHTS):
                 
                 if self.experts_method=='POE':
-                
-                    eps = 1e-6
-                    precisions, prec_mu = [], []
-                    for modality_num, (mu_m, var_m, input_m) in enumerate(zip(means, vars, inputs)):
-                        var_m = torch.clamp(var_m, min=eps)
-                        lambda_m = 1.0 / var_m
 
-                        if modality_num == 1:  
+                    eps = 1e-6
+                    weights = self.get_global_weights(numpy=False).to(means[0].device)
+                    assert weights.shape == (self.n_modalities, )
+                    precisions, prec_mu = [], []
+                    for modality_num, (mu_m, var_m, input_m) in enumerate(zip(shared_means, shared_vars, inputs)):
+                        var_m = torch.clamp(var_m, min=eps)
+                        # Modulate each expert's precision by its learned (or fixed) global
+                        # weight so the joint posterior is not dominated by the lowest-variance
+                        # modality. Without this the weights were a no-op under POE.
+                        lambda_m = weights[modality_num] * (1.0 / var_m)
+
+                        if modality_num == 1:
                             missing_mask = (input_m == 0).all(dim=1) | (input_m == 1000).all(dim=1)
                             lambda_m[missing_mask, :] = 0.0
                             mu_m[missing_mask, :] = 0.0
@@ -536,14 +606,12 @@ class MultiModalVAE(BaseModuleClass):
                     eta = torch.stack(prec_mu, dim=0).sum(dim=0)
                     shared_qzv = torch.clamp(1.0 / (Lambda + eps), min=eps)
                     shared_qzm = shared_qzv * eta
-                    weights = self.get_global_weights(numpy=False)
-                    assert weights.shape == (self.n_modalities, )
                     
                 elif self.experts_method=='MOE':
                     weights = self.get_global_weights(numpy=False)
                     assert weights.shape == (self.n_modalities, )
-                    shared_qzm = self._weighted_sum(means, weights)
-                    shared_qzv = self._weighted_sum(vars, torch.square(weights))
+                    shared_qzm = self._weighted_sum(shared_means, weights)
+                    shared_qzv = self._weighted_sum(shared_vars, torch.square(weights))
                 
                 
             elif self.agg_method in (AggMethod.AOE_PER_CELL_WEIGHTS,):
@@ -555,27 +623,39 @@ class MultiModalVAE(BaseModuleClass):
         shared_qz = Normal(shared_qzm, shared_qzv.sqrt())
         shared_z = shared_qz.rsample(sample_shape=sample_shape)
 
+        # Per-modality decoder latent: the POE-shared code concatenated with that modality's own
+        # private dims. Modality i is decoded only from shared + private_i (never another
+        # modality's private dims), so private_i is forced to carry modality-i-specific signal.
+        modality_z, modality_zm = [], []
+        for i in range(self.n_modalities):
+            if self.n_private[i] > 0:
+                modality_z.append(torch.cat([shared_z, priv_zs[i]], dim=-1))
+                modality_zm.append(torch.cat([shared_qzm, priv_means[i]], dim=-1))
+            else:
+                modality_z.append(shared_z)
+                modality_zm.append(shared_qzm)
 
-        return {"qzm": shared_qzm, "qzv": shared_qzv, "z": shared_z, 'qz': shared_qz, "modalities": inference_results, 
-                'inputs': inputs, 'weights': weights }
+        return {"qzm": shared_qzm, "qzv": shared_qzv, "z": shared_z, 'qz': shared_qz, "modalities": inference_results,
+                'inputs': inputs, 'weights': weights, 'modality_z': modality_z, 'modality_zm': modality_zm }
 
 
     def _get_generative_input(
         self, tensors: dict[str, torch.Tensor], inference_outputs: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         return {
-            "z": inference_outputs["z"],
+            "modality_z": inference_outputs["modality_z"],
             MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
         }
 
     @auto_move_data
-    def generative(self, z: torch.Tensor, batch_index: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Runs the generative model."""
+    def generative(self, modality_z: Sequence[torch.Tensor], batch_index: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Runs the generative model. ``modality_z[i]`` is the latent decoded for modality ``i``
+        (shared + modality-i private dims)."""
         px_params = []
         px_distrs = []
         px_infos = []
         for i, decoder in enumerate(self.decoders):
-            px_params_i, info = decoder(z, batch_index)
+            px_params_i, info = decoder(modality_z[i], batch_index)
             if decoder.distr == D.Beta and self.allow_beta_constant:
                 constant_prob, constant_value = info['constant_value_prob'], info['constant_value']
                 alpha, beta = px_params_i['concentration1'], px_params_i['concentration0']
@@ -632,9 +712,18 @@ class MultiModalVAE(BaseModuleClass):
 
         if self.unimodal_kl:
             for i, latent_param_dict in enumerate(inference_outputs['modalities']):
-                mod_post_dist = Normal(latent_param_dict['qzm'], torch.sqrt(latent_param_dict['qzv']))
-                mod_kl=kl(mod_post_dist, prior_dist).sum(dim=-1)
-                if i==1 and spatial_mask in tensors:
+                mod_qzm = latent_param_dict['qzm']
+                mod_post_dist = Normal(mod_qzm, torch.sqrt(latent_param_dict['qzv']))
+                # Size the prior to this modality's full posterior (shared + private dims).
+                mod_prior_dist = Normal(torch.zeros_like(mod_qzm), torch.ones_like(mod_qzm))
+                mod_kl_per_dim = kl(mod_post_dist, mod_prior_dist)
+                # Free bits: don't penalize latent dims whose KL is already below the floor,
+                # so the prior can't collapse a modality's posterior before its decoder learns
+                # to use it.
+                if self.free_bits > 0:
+                    mod_kl_per_dim = torch.clamp(mod_kl_per_dim, min=self.free_bits)
+                mod_kl = mod_kl_per_dim.sum(dim=-1)
+                if i == 1 and "spatial_masked" in tensors:
                     kl_divergence += (mod_kl * (1.0 - spatial_mask))
                 else:
                     kl_divergence += mod_kl

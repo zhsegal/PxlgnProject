@@ -1,0 +1,110 @@
+#!/bin/bash
+# ============================================================================
+# run_graph_phenotype.lsf — per-cell graph phenotype panel (topology + patches).
+#
+# Two ways to run, both supported:
+#
+# 1. From the notebook / command line, ONE JOB PER SAMPLE (args; resources go on the
+#    bsub command line because #BSUB directives are only parsed when the script is fed
+#    on stdin). This is what graph_phenotype_analysis.ipynb Step 0 does:
+#       bsub -J gphen-S001 -q gsla_high_gpu -gpu "num=1:j_exclusive=no" \
+#            -R rusage[mem=32G] -R affinity[thread*16] \
+#            -o logs/gphen-S001.out -e logs/gphen-S001.err \
+#            -- bash run_graph_phenotype.lsf --sample S001 --cell-types CD8,B
+#
+# Sizing, measured 2026-07-15 — mem 32G not 64G, but keep the 16 threads:
+#   * Memory: a running job peaks at 6-7.3G. The old 64G ask was ~10x over and needlessly
+#     narrowed the candidate hosts. 32G leaves ~4x headroom.
+#   * Cores: gphen achieves 2.86x parallelism on 4 threads (72% efficiency), so unlike
+#     chunglu (3.4x on 16) it scales well and genuinely wants the cores. At 4 workers a
+#     sample takes ~39 min (3.3 s/cell x 707 cells); at 16 it is ~3x faster. Do NOT cut
+#     threads here on chunglu's numbers — different script, different scaling.
+#   * Queue: `long` (priority 71, preemptable, public_cpu_hosts) can be so jammed that
+#     NOTHING places at any size — 2026-07-15 it had 2 ok hosts with ~1 free slot. Check
+#     `bhosts` on the host group before shrinking the ask; the pool may simply be empty.
+#     gsla_high_gpu dispatches instantly (dgn nodes hold 27-63 free cores) at the cost of
+#     one GPU from the group's 10-GPU quota. graph_phenotype.py never touches CUDA, so use
+#     j_exclusive=no and leave the idle card shareable.
+# Keep N_WORKERS in step with the affinity thread count.
+#
+# 2. As an LSF array over all 15 samples (stdin form, #BSUB directives apply):
+#       bsub < run_graph_phenotype.lsf
+#       bsub -J "gp-S001" -env "SAMPLE=S001" < run_graph_phenotype.lsf
+#
+# Note --cell-types is only reachable via form 1: LSF's -env separates variables with
+# commas, so -env "CELL_TYPES=CD8,B" would set CELL_TYPES=CD8 and treat B as a var name.
+# ============================================================================
+
+#BSUB -J gphen[1-15]
+#BSUB -q long
+#BSUB -R rusage[mem=32G]
+#BSUB -R affinity[thread*16]
+#BSUB -o /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/gphen_%J_%I.out
+#BSUB -e /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/gphen_%J_%I.err
+
+set -euo pipefail
+
+BASE_DIR="/home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data"
+ADATA="${BASE_DIR}/cache/adata_cytovi_annotated_compat.h5ad"
+OUTPUT_DIR="${BASE_DIR}/results/graph_phenotype"
+N_WORKERS=16
+N_PERM=20
+# 0 = native depth. Leave it. Downsampling to a common edge count was measured and makes the
+# depth confound WORSE (mean |rho| to depth 0.40 -> 0.88), because depth inflates edges and
+# pixels together. Depth is handled by cohort selection in graph_phenotype_analysis.ipynb.
+EDGE_BUDGETS="0"
+# Reuse the chunglu marker list so marker indices agree across the two modules.
+MARKER_NAMES="${BASE_DIR}/results/chunglu/marker_names.json"
+
+# Sample list (15 samples, S015 missing from delivery)
+SAMPLES=(S001 S002 S003 S004 S005 S006 S007 S008 S009 S010 S011 S012 S013 S014 S016)
+
+SAMPLE_NAME="${SAMPLE:-}"
+CELL_TYPES_ARG="${CELL_TYPES:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --sample)      SAMPLE_NAME="$2"; shift 2 ;;
+        --cell-types)  CELL_TYPES_ARG="$2"; shift 2 ;;
+        --n-perm)      N_PERM="$2"; shift 2 ;;
+        --n-workers)   N_WORKERS="$2"; shift 2 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+# No --sample and no SAMPLE env: we are the array job, pick by index.
+if [ -z "${SAMPLE_NAME}" ]; then
+    IDX=$((LSB_JOBINDEX - 1))
+    SAMPLE_NAME="${SAMPLES[$IDX]}"
+fi
+
+PXL="${BASE_DIR}/results/${SAMPLE_NAME}/layout/layout/${SAMPLE_NAME}.layout.pxl"
+if [ ! -f "${PXL}" ]; then
+    echo "ERROR: pxl not found: ${PXL}"
+    exit 1
+fi
+
+# Keep BLAS single-threaded; we parallelise across cells with ProcessPoolExecutor.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+set +u   # conda activate.d (libblas_mkl) reads unset vars; nounset would abort
+eval "$(conda shell.bash hook)"
+conda activate /home/projects/nyosef/zvise/.local/share/mamba/envs/pxlgn
+set -u
+
+echo "Graph phenotype panel for ${SAMPLE_NAME} (budgets=${EDGE_BUDGETS}, n_perm=${N_PERM}${CELL_TYPES_ARG:+, types=${CELL_TYPES_ARG}})"
+mkdir -p "${OUTPUT_DIR}" "${BASE_DIR}/results/logs"
+
+python "${BASE_DIR}/graph_phenotype.py" \
+    --sample "${SAMPLE_NAME}" \
+    --adata "${ADATA}" \
+    --pxl "${PXL}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --n-workers "${N_WORKERS}" \
+    --n-perm "${N_PERM}" \
+    --edge-budgets "${EDGE_BUDGETS}" \
+    --marker-names "${MARKER_NAMES}" \
+    ${CELL_TYPES_ARG:+--cell-types "${CELL_TYPES_ARG}"}

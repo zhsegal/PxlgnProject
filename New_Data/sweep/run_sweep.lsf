@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+PY=/home/projects/nyosef/zvise/.local/share/mamba/envs/pxlgn/bin/python3
+cd /home/projects/nyosef/zvise/PixelGen/PixelGen
+exec "$PY" New_Data/sweep/train_sweep.py "$@"

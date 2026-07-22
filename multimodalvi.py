@@ -217,6 +217,7 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         indices: Sequence[int] | None = None,
         give_mean: bool = True,
         modality: str = 'joint',
+        representation: str = 'shared',
         mc_samples: int = 5_000,
         batch_size: int | None = None,
         return_dist: bool = False,
@@ -228,6 +229,15 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         to initialize the model (or 'X' if layer=None was passed)
 
         This is typically denoted as :math:`z_n`.
+
+        The ``representation`` argument exposes the MMVAE+ (Strategy 4) shared/private blocks:
+
+        - ``'shared'`` (default): the shared code. Combined with ``modality`` exactly as before
+          (``modality='joint'`` -> shared joint latent; a modality key -> that modality's posterior).
+        - ``'joint_private'``: the shared joint latent concatenated with every modality's private block.
+        - ``'private'``: only the private block of ``modality`` (which must be a modality key, not 'joint').
+
+        For ``'joint_private'`` / ``'private'`` the model must have been built with ``n_private>0``.
 
         Parameters
         ----------
@@ -270,6 +280,10 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         self._check_if_trained(warn=False)
         if adata is not None and dataloader is not None:
             raise ValueError("Only one of `adata` or `dataloader` can be provided.")
+        if representation not in ('shared', 'joint_private', 'private'):
+            raise ValueError("representation must be one of 'shared', 'joint_private', 'private'")
+        if representation == 'private' and modality == 'joint':
+            raise ValueError("representation='private' requires a modality key (not 'joint')")
 
         if dataloader is None:
             adata = self._validate_anndata(adata)
@@ -285,24 +299,41 @@ class MultiModalSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 **self.module._get_inference_input(tensors)
             )
 
-            if modality != 'joint':
-                outputs = outputs['modalities'][self.modality_key_to_index[modality]]
-
-            if MODULE_KEYS.QZ_KEY in outputs:
-                qz: Distribution = outputs.get(MODULE_KEYS.QZ_KEY)
-                qzm: Tensor = qz.loc
-                qzv: Tensor = qz.scale.square()
-            else:
-                qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
-                qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
-                qz: Distribution = Normal(qzm, qzv.sqrt())
+            if representation == 'shared':
+                if modality != 'joint':
+                    outputs = outputs['modalities'][self.modality_key_to_index[modality]]
+                if MODULE_KEYS.QZ_KEY in outputs:
+                    qz: Distribution = outputs.get(MODULE_KEYS.QZ_KEY)
+                    qzm: Tensor = qz.loc
+                    qzv: Tensor = qz.scale.square()
+                else:
+                    qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
+                    qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
+                    qz: Distribution = Normal(qzm, qzv.sqrt())
+                z_sample: Tensor = outputs.get(MODULE_KEYS.Z_KEY)
+            elif representation == 'joint_private':
+                # shared joint latent ++ each modality's private block (skip empty / n_private==0 blocks).
+                priv_m = [p for p in outputs['priv_means'] if p.shape[-1] > 0]
+                priv_v = [v for v in outputs['priv_vars'] if v.shape[-1] > 0]
+                qzm = torch.cat([outputs['qzm']] + priv_m, dim=-1)
+                qzv = torch.cat([outputs['qzv']] + priv_v, dim=-1)
+                qz = Normal(qzm, qzv.sqrt())
+                z_sample = qz.rsample()
+            else:  # 'private'
+                idx = self.modality_key_to_index[modality]
+                qzm = outputs['priv_means'][idx]
+                qzv = outputs['priv_vars'][idx]
+                if qzm.shape[-1] == 0:
+                    raise ValueError(f"modality '{modality}' has no private dims (build the model with n_private>0)")
+                qz = Normal(qzm, qzv.sqrt())
+                z_sample = qz.rsample()
 
             if return_dist:
                 qz_means.append(qzm.cpu())
                 qz_vars.append(qzv.cpu())
                 continue
 
-            z: Tensor = qzm if give_mean else outputs.get(MODULE_KEYS.Z_KEY)
+            z: Tensor = qzm if give_mean else z_sample
 
             if give_mean and getattr(self.module, "latent_distribution", None) == "ln":
                 samples = qz.sample([mc_samples])

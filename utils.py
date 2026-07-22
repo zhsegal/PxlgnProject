@@ -906,6 +906,32 @@ def build_spatial_celltype_obsm(
     return target_key
 
 
+def build_triplet_asinh5_obsm(adata, results_dir, value_col="triplet_z", cofactor=5,
+                              raw_key="coloc_triplet", target_key="coloc_triplet_asinh5"):
+    """Build the per-cell triplet colocalization modality from Chung-Lu per-cell parquets.
+
+    Reads ``{results_dir}/*_triplets_percell.parquet`` (cols: component, marker_1/2/3,
+    ``value_col``), pivots to cells x "m1/m2/m3", reindexes to ``adata.obs_names`` (fill 0),
+    and writes the raw Z (``raw_key``) plus the arcsinh(z/cofactor) modality (``target_key``) --
+    the triplet analog of the doublet ``spatial_asinh5`` (same cofactor). Returns ``target_key``.
+    """
+    from pathlib import Path
+    files = sorted(Path(results_dir).glob("*_triplets_percell.parquet"))
+    assert files, f"no *_triplets_percell.parquet under {results_dir}"
+    df = pd.concat([pd.read_parquet(p, columns=["component", "marker_1", "marker_2", "marker_3",
+                                                value_col]) for p in files], ignore_index=True)
+    df["feat"] = df[["marker_1", "marker_2", "marker_3"]].astype(str).agg("/".join, axis=1)
+    wide = (df.pivot_table(index="component", columns="feat", values=value_col, aggfunc="first")
+              .reindex(adata.obs_names).fillna(0.0))
+    base = wide.to_numpy(float)
+    adata.obsm[raw_key]    = pd.DataFrame(base, index=wide.index, columns=wide.columns)
+    adata.obsm[target_key] = pd.DataFrame(np.arcsinh(base / cofactor), index=wide.index,
+                                          columns=wide.columns)
+    print(f"Created obsm keys: {raw_key}, {target_key}  shape={adata.obsm[target_key].shape}  "
+          f"(nonzero rate {np.mean(base != 0):.3f}, arcsinh(z/{cofactor}))")
+    return target_key
+
+
 def _resolve_pair_col(m1, m2, valid_pairs, sep="/"):
     """Return the existing pair-column name for (m1, m2), order-agnostic, or None."""
     a, b = f"{m1}{sep}{m2}", f"{m2}{sep}{m1}"

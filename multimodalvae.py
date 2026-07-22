@@ -349,6 +349,15 @@ class MultiModalVAE(BaseModuleClass):
         decoder_dispersions: Optional[Sequence[str]] = None,
         free_bits: float = 0.0,
         n_private: Union[int, Sequence[int]] = 0,
+        weight_floor: float = 0.0,
+        weight_entropy_reg: float = 0.0,
+        poe_calibration: Optional[Literal['temperature', 'balanced']] = None,
+        objective: Literal['elbo', 'mvtcae'] = 'elbo',
+        tc_alpha: float = 0.5,
+        tc_beta: float = 1.0,
+        cross_reconstruction: bool = False,
+        cross_recon_weight: float = 1.0,
+        private_prior: Literal['standard'] = 'standard',
     ):
         '''
         param distrs: list of distributions for the modalities (including main)
@@ -362,7 +371,27 @@ class MultiModalVAE(BaseModuleClass):
         param external_kl_weight: Multiply KL term(s) by external_kl_weight (good for debugging)
         param encoder_kwargs: kwargs to init of encoder. Will take precedence over arguments passed outside encoder_kwargs.
         param decoder_kwargs: kwargs to init of decoder. Will take precedence over arguments passed outside decoder_kwargs.
-        param n_obs: number of observations 
+        param n_obs: number of observations
+
+        Anti-modality-collapse fusion options (all default to current behaviour):
+        param weight_floor: float, default 0.0. If >0, reserve at least this mass for every modality
+            weight: w = weight_floor + (1 - n_modalities*weight_floor)*softmax(raw). (Strategy 1)
+        param weight_entropy_reg: float, default 0.0. If >0, add weight_entropy_reg*(log(M) - H(w))
+            to the loss to push modality weights toward uniform (anti-collapse). (Strategy 1)
+        param poe_calibration: None | 'temperature' | 'balanced', default None. POE-only precision
+            calibration. 'temperature' learns a per-modality precision temperature; 'balanced'
+            normalises each expert's precision to a common scale before the product. (Strategy 2)
+        param objective: 'elbo' | 'mvtcae', default 'elbo'. 'mvtcae' replaces the summed-ELBO KL with
+            the total-correlation decomposition (VIB + per-modality CVIB). (Strategy 3)
+        param tc_alpha: float, default 0.5. MVTCAE balance: rec_weight=(M-alpha)/M, vib_weight=(1-alpha),
+            cvib_weight=alpha/M. (Strategy 3)
+        param tc_beta: float, default 1.0. MVTCAE weight on the combined KL terms. (Strategy 3)
+        param cross_reconstruction: bool, default False. If True (MMVAE+), additionally decode each
+            modality from the OTHER modality's shared code + a private draw from the auxiliary prior,
+            forcing the shared code to be sufficient for both modalities. Needs n_private>0. (Strategy 4)
+        param cross_recon_weight: float, default 1.0. Down-weight on the cross-reconstruction terms. (Strategy 4)
+        param private_prior: 'standard', default 'standard'. Auxiliary prior r(z_priv) on private latents
+            (standard Normal). (Strategy 4)
         '''
         
         #TODO - allow passing kwargs to the decoders
@@ -400,6 +429,24 @@ class MultiModalVAE(BaseModuleClass):
         self.joint_kl = joint_kl
         self.allow_beta_constant = allow_beta_constant
         self.free_bits = free_bits
+
+        # --- Anti-modality-collapse fusion options (all default to a no-op = current behaviour) ---
+        # S1: MoE/PoE weight-collapse fix
+        self.weight_floor = weight_floor
+        self.weight_entropy_reg = weight_entropy_reg
+        if self.weight_floor > 0:
+            assert self.weight_floor * self.n_modalities < 1, \
+                "weight_floor * n_modalities must be < 1"
+        # S2: PoE precision calibration ('temperature' | 'balanced' | None)
+        self.poe_calibration = poe_calibration
+        # S3: total-correlation (MVTCAE) objective
+        self.objective = objective
+        self.tc_alpha = tc_alpha
+        self.tc_beta = tc_beta
+        # S4: MMVAE+ cross-modal reconstruction
+        self.cross_reconstruction = cross_reconstruction
+        self.cross_recon_weight = cross_recon_weight
+        self.private_prior = private_prior
 
         if decoder_dispersions is None:
             decoder_dispersions = ['gene-cell'] * self.n_modalities
@@ -492,6 +539,11 @@ class MultiModalVAE(BaseModuleClass):
         elif self.agg_method == AggMethod.AOE_PER_CELL_WEIGHTS:
             self.weight_encoder = FCLayers(n_in=sum(self.input_ds), n_out=self.n_modalities, n_layers=1)
 
+        # S2: learnable per-modality precision temperature (POE). exp(0)=1 at init, so this only
+        # changes behaviour once trained, and only when poe_calibration=='temperature'.
+        if self.poe_calibration == 'temperature':
+            self.precision_log_temp = nn.Parameter(torch.zeros((self.n_modalities, )))
+
     
     def _weighted_sum(self, tensors, weights):
         '''
@@ -517,6 +569,14 @@ class MultiModalVAE(BaseModuleClass):
             "inputs": [tensors[REGISTRY_KEYS.X_KEY]] + [tensors[REGISTRY_MODALITY_KEYS[i]] for i in range(1, self.n_modalities)],
         }
 
+    def _apply_weight_floor(self, weights):
+        '''S1: reserve at least ``weight_floor`` of the mass for every modality (applied along the
+        last dim). Works for global ``(n_modalities,)`` and per-cell ``(batch, n_modalities)`` weights.
+        No-op when ``weight_floor == 0`` (default), so the un-floored weights are returned unchanged.'''
+        if self.weight_floor <= 0:
+            return weights
+        return self.weight_floor + (1.0 - self.n_modalities * self.weight_floor) * weights
+
     def get_global_weights(self, numpy=True):
         if self.agg_method == AggMethod.AOE_GLOBAL_WEIGHTS:
             weights = F.softmax(self.learned_weights, dim=0)
@@ -524,6 +584,7 @@ class MultiModalVAE(BaseModuleClass):
             weights = self.fixed_weights
         else:
             return None
+        weights = self._apply_weight_floor(weights)
         return weights.numpy(force=True) if numpy else weights
 
     def get_per_cell_weights(self, inputs, grad=False, numpy=True):
@@ -533,6 +594,7 @@ class MultiModalVAE(BaseModuleClass):
             concat_input = torch.concat(inputs, dim=-1).to(device=self.device)
             scores = self.weight_encoder(concat_input)
             weights = F.softmax(scores, dim=1)
+            weights = self._apply_weight_floor(weights)
             return weights if not numpy else weights.numpy(force=True)
 
 
@@ -571,6 +633,7 @@ class MultiModalVAE(BaseModuleClass):
         shared_means = [m[..., :n_shared] for m in means]
         shared_vars = [v[..., :n_shared] for v in vars]
         priv_means = [m[..., n_shared:] for m in means]
+        priv_vars = [v[..., n_shared:] for v in vars]
         priv_zs = [z[..., n_shared:] for z in zs]
 
         if self.agg_method.name == 'SHARED_ENCODER':
@@ -592,7 +655,18 @@ class MultiModalVAE(BaseModuleClass):
                         # Modulate each expert's precision by its learned (or fixed) global
                         # weight so the joint posterior is not dominated by the lowest-variance
                         # modality. Without this the weights were a no-op under POE.
-                        lambda_m = weights[modality_num] * (1.0 / var_m)
+                        prec_m = 1.0 / var_m
+                        # S2: PoE precision calibration (default None -> identical to weights*1/var).
+                        if self.poe_calibration == 'balanced':
+                            # Normalise each expert's precision to a common scale before the product
+                            # so neither modality's summed precision can run away. Changes the absolute
+                            # variance scale of the joint posterior (downstream uses the latent mean).
+                            prec_m = prec_m / (prec_m.mean(dim=-1, keepdim=True) + eps)
+                        lambda_m = weights[modality_num] * prec_m
+                        if self.poe_calibration == 'temperature':
+                            # Learnable per-modality precision temperature: discount an overconfident
+                            # expert. exp(0)=1 at init.
+                            lambda_m = torch.exp(-self.precision_log_temp[modality_num]) * lambda_m
 
                         if modality_num == 1:
                             missing_mask = (input_m == 0).all(dim=1) | (input_m == 1000).all(dim=1)
@@ -623,6 +697,16 @@ class MultiModalVAE(BaseModuleClass):
         shared_qz = Normal(shared_qzm, shared_qzv.sqrt())
         shared_z = shared_qz.rsample(sample_shape=sample_shape)
 
+        # S4: per-modality shared samples (the shared code as seen by each modality's own encoder),
+        # needed for MMVAE+ cross-reconstruction. Only sampled when cross_reconstruction is on, so the
+        # default path consumes no extra RNG and is bit-for-bit unchanged.
+        shared_zs = None
+        if self.cross_reconstruction:
+            shared_zs = [
+                Normal(sm, torch.clamp(sv, min=1e-6).sqrt()).rsample(sample_shape=sample_shape)
+                for sm, sv in zip(shared_means, shared_vars)
+            ]
+
         # Per-modality decoder latent: the POE-shared code concatenated with that modality's own
         # private dims. Modality i is decoded only from shared + private_i (never another
         # modality's private dims), so private_i is forced to carry modality-i-specific signal.
@@ -636,7 +720,12 @@ class MultiModalVAE(BaseModuleClass):
                 modality_zm.append(shared_qzm)
 
         return {"qzm": shared_qzm, "qzv": shared_qzv, "z": shared_z, 'qz': shared_qz, "modalities": inference_results,
-                'inputs': inputs, 'weights': weights, 'modality_z': modality_z, 'modality_zm': modality_zm }
+                'inputs': inputs, 'weights': weights, 'modality_z': modality_z, 'modality_zm': modality_zm,
+                # Extra keys for S3 (MVTCAE) / S4 (MMVAE+) and the get_latent_representation accessors.
+                # Backward-compatible: existing consumers ignore them.
+                'shared_means': shared_means, 'shared_vars': shared_vars,
+                'priv_means': priv_means, 'priv_vars': priv_vars, 'priv_zs': priv_zs,
+                'shared_zs': shared_zs }
 
 
     def _get_generative_input(
@@ -702,49 +791,110 @@ class MultiModalVAE(BaseModuleClass):
 
         prior_dist = Normal(torch.zeros_like(joint_qzm), torch.ones_like(joint_qzv))
 
-        if self.joint_kl:
-            var_post_dist = inference_outputs['qz']
-            kl_divergence += kl(var_post_dist, prior_dist).sum(dim=-1)
-
         spatial_mask = None
         if "spatial_masked" in tensors:
             spatial_mask = tensors["spatial_masked"].to(joint_qzm.device).float().squeeze()
 
-        if self.unimodal_kl:
-            for i, latent_param_dict in enumerate(inference_outputs['modalities']):
-                mod_qzm = latent_param_dict['qzm']
-                mod_post_dist = Normal(mod_qzm, torch.sqrt(latent_param_dict['qzv']))
-                # Size the prior to this modality's full posterior (shared + private dims).
-                mod_prior_dist = Normal(torch.zeros_like(mod_qzm), torch.ones_like(mod_qzm))
-                mod_kl_per_dim = kl(mod_post_dist, mod_prior_dist)
-                # Free bits: don't penalize latent dims whose KL is already below the floor,
-                # so the prior can't collapse a modality's posterior before its decoder learns
-                # to use it.
-                if self.free_bits > 0:
-                    mod_kl_per_dim = torch.clamp(mod_kl_per_dim, min=self.free_bits)
-                mod_kl = mod_kl_per_dim.sum(dim=-1)
-                if i == 1 and "spatial_masked" in tensors:
-                    kl_divergence += (mod_kl * (1.0 - spatial_mask))
-                else:
-                    kl_divergence += mod_kl
+        # S3: reconstruction is down-weighted by (M - alpha)/M under MVTCAE; ELBO keeps 1.0.
+        rec_weight = 1.0
 
-    
+        if self.objective == 'mvtcae':
+            # Total-correlation objective (Hwang et al., NeurIPS 2021). Coefficients verified against
+            # multi-view-AE `mvtcae.py`: rec_weight=(M-a)/M, vib_weight=(1-a), cvib_weight=a/M, all KL
+            # terms scaled by tc_beta. Replaces the summed-ELBO joint/unimodal KL entirely.
+            M = self.n_modalities
+            q_joint = inference_outputs['qz']
+            grp_kl = kl(q_joint, prior_dist).sum(dim=-1)  # VIB:  KL(q(z|X) || p(z))
+            cvib_kl = 0
+            for m, (sm, sv) in enumerate(zip(inference_outputs['shared_means'], inference_outputs['shared_vars'])):
+                q_uni = Normal(sm, torch.clamp(sv, min=1e-6).sqrt())
+                mod_cvib = kl(q_joint, q_uni).sum(dim=-1)  # CVIB: KL(q(z|X) || q(z|x_m))
+                if m == 1 and "spatial_masked" in tensors:
+                    mod_cvib = mod_cvib * (1.0 - spatial_mask)
+                cvib_kl = cvib_kl + mod_cvib
+            vib_weight = 1.0 - self.tc_alpha
+            cvib_weight = self.tc_alpha / M
+            rec_weight = (M - self.tc_alpha) / M
+            kl_divergence = self.tc_beta * (vib_weight * grp_kl + cvib_weight * cvib_kl)
+        else:
+            if self.joint_kl:
+                var_post_dist = inference_outputs['qz']
+                kl_divergence += kl(var_post_dist, prior_dist).sum(dim=-1)
+
+            if self.unimodal_kl:
+                for i, latent_param_dict in enumerate(inference_outputs['modalities']):
+                    mod_qzm = latent_param_dict['qzm']
+                    mod_post_dist = Normal(mod_qzm, torch.sqrt(latent_param_dict['qzv']))
+                    # Size the prior to this modality's full posterior (shared + private dims).
+                    mod_prior_dist = Normal(torch.zeros_like(mod_qzm), torch.ones_like(mod_qzm))
+                    mod_kl_per_dim = kl(mod_post_dist, mod_prior_dist)
+                    # Free bits: don't penalize latent dims whose KL is already below the floor,
+                    # so the prior can't collapse a modality's posterior before its decoder learns
+                    # to use it.
+                    if self.free_bits > 0:
+                        mod_kl_per_dim = torch.clamp(mod_kl_per_dim, min=self.free_bits)
+                    mod_kl = mod_kl_per_dim.sum(dim=-1)
+                    if i == 1 and "spatial_masked" in tensors:
+                        kl_divergence += (mod_kl * (1.0 - spatial_mask))
+                    else:
+                        kl_divergence += mod_kl
+
+
         inputs = inference_outputs['inputs']
         log_lik = 0
         for i, (input, distr, loss_weight) in enumerate(zip(inputs, generative_outputs["px_distrs"], self._loss_weights)):
             mod_log_lik = distr.log_prob(input).sum(dim=-1)
-            
-            if i == 1 and "spatial_masked" in tensors:                
-                mod_log_lik = mod_log_lik * (1.0 - spatial_mask)                    
-                   
+
+            if i == 1 and "spatial_masked" in tensors:
+                mod_log_lik = mod_log_lik * (1.0 - spatial_mask)
+
             log_lik += loss_weight*mod_log_lik
 
-        elbo = log_lik - kl_weight*self.external_kl_weight*kl_divergence
+        # S4: MMVAE+ cross-modal reconstruction. Decode modality i from the OTHER modality's shared
+        # code + a private draw from the auxiliary prior r(z_priv)=N(0,I), forcing the shared code to
+        # be sufficient to reconstruct both modalities (anti-collapse). Off by default.
+        if self.cross_reconstruction and self.n_modalities > 1:
+            shared_zs = inference_outputs['shared_zs']
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            cross_z = []
+            for i in range(self.n_modalities):
+                others = [shared_zs[j] for j in range(self.n_modalities) if j != i]
+                # 2-modality: the single "other" modality; >2: average of the others' shared codes.
+                w_other = others[0] if len(others) == 1 else torch.stack(others, dim=0).mean(dim=0)
+                if self.n_private[i] > 0:
+                    priv_prior = torch.randn(
+                        (*w_other.shape[:-1], self.n_private[i]),
+                        device=w_other.device, dtype=w_other.dtype,
+                    )
+                    cross_z.append(torch.cat([w_other, priv_prior], dim=-1))
+                else:
+                    cross_z.append(w_other)
+            cross_gen = self.generative(cross_z, batch_index)
+            for i, (input, distr, loss_weight) in enumerate(zip(inputs, cross_gen["px_distrs"], self._loss_weights)):
+                mod_log_lik = distr.log_prob(input).sum(dim=-1)
+                if i == 1 and "spatial_masked" in tensors:
+                    mod_log_lik = mod_log_lik * (1.0 - spatial_mask)
+                log_lik += self.cross_recon_weight * loss_weight * mod_log_lik
+
+        elbo = rec_weight*log_lik - kl_weight*self.external_kl_weight*kl_divergence
         loss = torch.mean(-elbo)
+
+        # S1: weight-entropy regulariser. Pushes modality weights toward uniform (max entropy),
+        # countering MoE/PoE weight collapse. Penalty = reg*(log(M) - H(w)) >= 0, min at uniform.
+        extra_metrics = {}
+        if self.weight_entropy_reg > 0 and inference_outputs.get('weights', None) is not None:
+            w = inference_outputs['weights']
+            H = -(w * torch.log(torch.clamp(w, min=1e-8))).sum(dim=-1)  # scalar (global) or (batch,)
+            if w.dim() > 1:
+                H = H.mean()  # per-cell weights: average entropy over the minibatch
+            entropy_penalty = self.weight_entropy_reg * (float(np.log(self.n_modalities)) - H)
+            loss = loss + entropy_penalty
+            extra_metrics['weight_entropy_penalty'] = entropy_penalty
 
         return LossOutput(
             loss=loss,
             reconstruction_loss=-log_lik,
             kl_local=kl_divergence,
             kl_global=0.0,
+            extra_metrics=extra_metrics,
         )

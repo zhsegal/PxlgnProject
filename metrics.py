@@ -25,19 +25,27 @@ from sklearn.metrics import (
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 
-from PixelGen.scvi_utils import get_rep, calc_PCA
+from scvi_utils import get_rep, calc_PCA
 
 
-def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=None, pca_kwargs={}, neighbors_kwargs={}):
+def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=None, pca_kwargs={},
+                                    neighbors_kwargs={}, compute_gearys=False, use_cache=True):
     '''
     latent_keys: list of keys in adata.obsm
     names: name for each latent (for dataframe result)
     rep_key: representation (layer or obsm key) for which to compute autocorrelation in the latent
     vars: list of vars to include in computation in rep_key
+    compute_gearys: also return Geary's C (default False — Moran's I only is ~2x faster on the metric step)
+    use_cache: skip the PCA + kNN graph for a latent_key whose '{key}_pca' + graph already exist.
+               Dedups keys repeated across calls (e.g. shared anchors) and makes cell re-runs cheap.
+               Pass False to force recompute if a latent's obsm array changed under the same key.
     '''
     ret = []
+    s_conn = 'connectivities'
 
     for latent_key in latent_keys:
+        if use_cache and f'{latent_key}_pca' in adata.obsm and f'{latent_key}_{s_conn}' in adata.obsp:
+            continue
         dim = adata.obsm[latent_key].shape[1]
         kw = dict(pca_kwargs)
         if 'n_comps' in kw:
@@ -50,7 +58,6 @@ def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=Non
     for (latent_key, name) in zip(latent_keys, names):
 
         # Need to work around the fact that use_graph is not supported in anndata
-        s_conn = 'connectivities'
         neighbors_conn_key = f'{latent_key}_{s_conn}'
         requested_conn = adata.obsp[neighbors_conn_key]
         existing_conn = adata.obsp.get(s_conn)
@@ -62,21 +69,104 @@ def distr_autocorrelation_in_latent(adata, latent_keys, names, rep_key, vars=Non
         rep = rep.loc[:, vars]
         rep = rep.to_numpy().T
 
-        autocorr = pd.DataFrame(
-            {
-                'morans': sc.metrics.morans_i(adata, vals=rep),
-                'gearys': sc.metrics.gearys_c(adata, vals=rep),
-                'latent': name,
-            },
-            index=vars,
-        )
+        cols = {'morans': sc.metrics.morans_i(adata, vals=rep)}
+        if compute_gearys:
+            cols['gearys'] = sc.metrics.gearys_c(adata, vals=rep)
+        cols['latent'] = name
+        autocorr = pd.DataFrame(cols, index=vars)
 
         if existing_conn is not None:
             adata.obsp[s_conn] = existing_conn
-        
+
         ret.append(autocorr)
 
     return pd.concat(ret, axis=0)
+
+
+def _mean_negative_elbo(model, adata, batch_size=None):
+    '''Mean per-cell negative ELBO (the model's own loss objective) over ``adata``.'''
+    from scvi import REGISTRY_KEYS
+    module = model.module
+    dl = model._make_data_loader(adata=model._validate_anndata(adata), batch_size=batch_size)
+    total, n = 0.0, 0
+    with torch.inference_mode():
+        for tensors in dl:
+            inf_out = module.inference(**module._get_inference_input(tensors))
+            gen_out = module.generative(**module._get_generative_input(tensors, inf_out))
+            out = module.loss(tensors, inf_out, gen_out)
+            b = tensors[REGISTRY_KEYS.X_KEY].shape[0]
+            total += float(out.loss) * b
+            n += b
+    return total / max(n, 1)
+
+
+def spatial_latent_usage(
+    model, adata, spatial_key, sentinel='missing', batch_size=None,
+    morans_kwargs=None,
+):
+    '''Headline anti-collapse metric: how much the joint latent actually *uses* the spatial modality.
+
+    Ablates the spatial input (replaces ``adata.obsm[spatial_key]`` with a constant sentinel) and
+    measures the model's response. A model that truly fuses spatial should degrade on all three:
+
+    - ``delta_elbo``      : mean negative-ELBO(ablated) - mean negative-ELBO(full). Higher = spatial matters.
+    - ``latent_cosine_shift`` : mean per-cell cosine distance between full and ablated joint latents.
+    - ``morans_drop``     : mean spatial-feature Moran's I on the full vs ablated joint latent (full - ablated).
+
+    Parameters
+    ----------
+    model : trained ``MultiModalSCVI``.
+    adata : AnnData used to train the model (spatial modality in ``obsm[spatial_key]`` as a DataFrame).
+    spatial_key : obsm key of the spatial modality to ablate.
+    sentinel : 'missing' (constant 1000, matches the POE missing-spatial mask) or 'zeros'.
+    Returns a one-row ``pd.DataFrame``.
+    '''
+    morans_kwargs = morans_kwargs or {}
+    fill = 1000.0 if sentinel == 'missing' else 0.0
+
+    # Full vs spatial-ablated joint latents.
+    z_full = model.get_latent_representation(adata, modality='joint', batch_size=batch_size)
+
+    adata_abl = adata.copy()
+    spatial_df = adata.obsm[spatial_key]
+    adata_abl.obsm[spatial_key] = pd.DataFrame(
+        np.full(spatial_df.shape, fill, dtype=np.asarray(spatial_df).dtype),
+        index=spatial_df.index, columns=spatial_df.columns,
+    )
+    z_abl = model.get_latent_representation(adata_abl, modality='joint', batch_size=batch_size)
+
+    # (a) delta ELBO
+    elbo_full = _mean_negative_elbo(model, adata, batch_size=batch_size)
+    elbo_abl = _mean_negative_elbo(model, adata_abl, batch_size=batch_size)
+    delta_elbo = elbo_abl - elbo_full
+
+    # (b) latent cosine shift (mean over cells of 1 - cos(z_full, z_abl))
+    a = z_full / (np.linalg.norm(z_full, axis=1, keepdims=True) + 1e-12)
+    b = z_abl / (np.linalg.norm(z_abl, axis=1, keepdims=True) + 1e-12)
+    latent_cosine_shift = float(np.mean(1.0 - np.sum(a * b, axis=1)))
+
+    # (c) spatial-feature Moran's I in full vs ablated latent (graph built on each latent;
+    # spatial features taken from the original obsm). Reuses distr_autocorrelation_in_latent.
+    adata.obsm['_slu_full'] = z_full
+    adata.obsm['_slu_abl'] = z_abl
+    try:
+        ac = distr_autocorrelation_in_latent(
+            adata, latent_keys=['_slu_full', '_slu_abl'], names=['full', 'ablated'],
+            rep_key=spatial_key, **morans_kwargs,
+        )
+    finally:
+        adata.obsm.pop('_slu_full', None)
+        adata.obsm.pop('_slu_abl', None)
+    morans_full = float(ac.loc[ac['latent'] == 'full', 'morans'].mean())
+    morans_abl = float(ac.loc[ac['latent'] == 'ablated', 'morans'].mean())
+
+    return pd.DataFrame([{
+        'delta_elbo': delta_elbo,
+        'latent_cosine_shift': latent_cosine_shift,
+        'morans_full': morans_full,
+        'morans_ablated': morans_abl,
+        'morans_drop': morans_full - morans_abl,
+    }])
 
 
 

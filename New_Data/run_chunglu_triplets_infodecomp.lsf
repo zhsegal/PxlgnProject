@@ -1,0 +1,76 @@
+#!/bin/bash
+# ============================================================================
+# run_chunglu_triplets_infodecomp.lsf — PER-CELL wedge Z for the COMBINED
+# information-decomposition list (selected 171 + ~500 random), one LSF array
+# job per PNA sample. Uses the EXTENDED per-cell path (per-center W_c*/EW_c*
+# columns) that chunglu_triplets.py now emits, needed for the pairwise
+# (connected) decomposition. Writes to a SEPARATE output dir so the existing
+# results/chunglu/*_triplets_percell.parquet (used by
+# triplet_ht_nalm_vs_ht_hb_analysis.ipynb) are NOT clobbered.
+#
+# Prereq: python build_random_triplet_list.py   (writes triplet_infodecomp_list.json)
+#
+# Usage:
+#   bsub < run_chunglu_triplets_infodecomp.lsf                                    # all 15 samples
+#   bsub -J "clid-S001" -env "SAMPLE=S001" < run_chunglu_triplets_infodecomp.lsf  # single sample
+# ============================================================================
+
+#BSUB -J clid[1-15]
+#BSUB -q long
+#BSUB -R rusage[mem=8G]
+#BSUB -R affinity[thread*8]
+#BSUB -o /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/clid_%J_%I.out
+#BSUB -e /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/clid_%J_%I.err
+
+set -euo pipefail
+
+BASE_DIR="/home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data"
+ADATA="${BASE_DIR}/cache/adata_annotated.h5ad"
+OUTPUT_DIR="${BASE_DIR}/results/chunglu/infodecomp"
+TRIPLET_LIST="${BASE_DIR}/results/chunglu/triplet_infodecomp_list.json"
+N_WORKERS=8
+VAR_MODE="lead"
+
+# Sample list (15 samples, S015 missing from delivery)
+SAMPLES=(S001 S002 S003 S004 S005 S006 S007 S008 S009 S010 S011 S012 S013 S014 S016)
+
+if [ -n "${SAMPLE:-}" ]; then
+    SAMPLE_NAME="${SAMPLE}"
+else
+    IDX=$((LSB_JOBINDEX - 1))
+    SAMPLE_NAME="${SAMPLES[$IDX]}"
+fi
+
+PXL="${BASE_DIR}/results/${SAMPLE_NAME}/layout/layout/${SAMPLE_NAME}.layout.pxl"
+if [ ! -f "${PXL}" ]; then
+    echo "ERROR: pxl not found: ${PXL}"
+    exit 1
+fi
+if [ ! -f "${TRIPLET_LIST}" ]; then
+    echo "ERROR: triplet list not found: ${TRIPLET_LIST} (run build_random_triplet_list.py first)"
+    exit 1
+fi
+
+# Keep BLAS single-threaded; we parallelise across cells with ProcessPoolExecutor.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+set +u   # conda activate.d (libblas_mkl) reads unset vars; nounset would abort
+eval "$(conda shell.bash hook)"
+conda activate /home/projects/nyosef/zvise/.local/share/mamba/envs/pxlgn
+set -u
+
+echo "Chung-Lu per-cell wedge (infodecomp combined list) for ${SAMPLE_NAME}"
+mkdir -p "${OUTPUT_DIR}"
+
+python "${BASE_DIR}/chunglu_triplets.py" \
+    --sample "${SAMPLE_NAME}" \
+    --adata "${ADATA}" \
+    --pxl "${PXL}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --n-workers "${N_WORKERS}" \
+    --var-mode "${VAR_MODE}" \
+    --triplet-list "${TRIPLET_LIST}"

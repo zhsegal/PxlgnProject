@@ -1,0 +1,52 @@
+#!/bin/bash
+# ============================================================================
+# run_pixelator_pna.lsf — LSF batch job wrapper for pixelator PNA pipeline
+#
+# Usage:
+#   bsub < run_pixelator_pna.lsf                          # runs all samples
+#   bsub -J "pxl-S001" -env "SAMPLE=S001" < run_pixelator_pna.lsf  # single sample
+#
+# Or use run_all_samples.sh to submit all jobs automatically.
+# ============================================================================
+
+#BSUB -J pxl-pna[1-15]
+#BSUB -q long
+#BSUB -R rusage[mem=64G]
+#BSUB -R affinity[thread*16]
+#BSUB -o /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/lsf_%J_%I.out
+#BSUB -e /home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data/results/logs/lsf_%J_%I.err
+
+BASE_DIR="/home/projects/nyosef/zvise/PixelGen/PixelGen/New_Data"
+EXTRACTED_DIR="${BASE_DIR}/raw_data/extracted"
+
+# Sample list (15 samples, S015 missing from delivery)
+SAMPLES=(S001 S002 S003 S004 S005 S006 S007 S008 S009 S010 S011 S012 S013 S014 S016)
+
+# If SAMPLE env var is set, use it directly; otherwise use array index
+if [ -n "${SAMPLE:-}" ]; then
+    SAMPLE_NAME="${SAMPLE}"
+else
+    # LSF_JOBINDEX is 1-based
+    IDX=$((LSB_JOBINDEX - 1))
+    SAMPLE_NAME="${SAMPLES[$IDX]}"
+fi
+
+# Find the FASTQ directory for this sample across all extracted tar dirs
+FASTQ_DIR=""
+for dir in "${EXTRACTED_DIR}"/X201SC26026419-Z01-F001_*/01.RawData/${SAMPLE_NAME}; do
+    if [ -d "$dir" ]; then
+        FASTQ_DIR="$dir"
+        break
+    fi
+done
+
+if [ -z "${FASTQ_DIR}" ]; then
+    echo "ERROR: Could not find FASTQ directory for ${SAMPLE_NAME}"
+    exit 1
+fi
+
+echo "Running pixelator PNA pipeline for ${SAMPLE_NAME}"
+echo "FASTQ dir: ${FASTQ_DIR}"
+
+# No conda activation needed — run_pixelator_pna.sh uses full pixelator path
+bash "${BASE_DIR}/run_pixelator_pna.sh" "${SAMPLE_NAME}" "${FASTQ_DIR}" 16
